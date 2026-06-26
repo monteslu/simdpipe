@@ -157,6 +157,35 @@ static inline v128_t sp_tex_nearest4(v128_t u, v128_t v, v128_t mask) {
   return wasm_v128_load(out);
 }
 
+/* sample texture bilinear, 4 lanes (4 taps/lane = the expensive path). */
+static inline v128_t sp_tex_bilinear4(v128_t u, v128_t v, v128_t mask) {
+  const uint32_t *tex = g_ctx.tex;
+  int tw = g_ctx.tex_w, th = g_ctx.tex_h;
+  uint32_t out[4];
+  float uu[4], vv[4]; uint32_t mm[4];
+  wasm_v128_store(uu, u); wasm_v128_store(vv, v); wasm_v128_store(mm, mask);
+  for (int i = 0; i < 4; i++) {
+    if (!mm[i]) { out[i] = 0; continue; }
+    float fx = uu[i] - 0.5f, fy = vv[i] - 0.5f;
+    int x0 = (int)floorf(fx), y0 = (int)floorf(fy);
+    float dx = fx - (float)x0, dy = fy - (float)y0;
+    int x1 = x0 + 1, y1 = y0 + 1;
+    int x0m = x0 & (tw - 1), x1m = x1 & (tw - 1), y0m = y0 & (th - 1), y1m = y1 & (th - 1);
+    uint32_t c00 = tex[y0m * tw + x0m], c10 = tex[y0m * tw + x1m];
+    uint32_t c01 = tex[y1m * tw + x0m], c11 = tex[y1m * tw + x1m];
+    float w00 = (1 - dx) * (1 - dy), w10 = dx * (1 - dy), w01 = (1 - dx) * dy, w11 = dx * dy;
+    uint32_t res = 0;
+    for (int s = 0; s < 32; s += 8) {
+      float c = ((c00 >> s) & 0xff) * w00 + ((c10 >> s) & 0xff) * w10
+              + ((c01 >> s) & 0xff) * w01 + ((c11 >> s) & 0xff) * w11;
+      int ci = (int)(c + 0.5f); if (ci > 255) ci = 255;
+      res |= ((uint32_t)ci) << s;
+    }
+    out[i] = res;
+  }
+  return wasm_v128_load(out);
+}
+
 /* Thread-local Y-band clip. Each worker rasterizes the WHOLE triangle list but
  * only writes rows [clip_y0, clip_y1). Bands are disjoint → no two threads ever
  * touch the same framebuffer pixel → zero locking. Defaults cover full height. */
@@ -226,6 +255,7 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
 
   int do_depth = (ctx->flags & SP_FLAG_DEPTH_TEST) != 0;
   int do_tex   = (ctx->flags & SP_FLAG_TEXTURE) != 0 && ctx->tex != NULL;
+  int do_bilin = (ctx->flags & SP_FLAG_BILINEAR) != 0;
   int do_blend = (ctx->flags & SP_FLAG_BLEND) != 0;
 
   v128_t lane_offset = wasm_f32x4_make(0.0f, 1.0f, 2.0f, 3.0f); /* 4 px in a row */
@@ -314,7 +344,8 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
         /* to texel space */
         u = wasm_f32x4_mul(u, tex_wf);
         v = wasm_f32x4_mul(v, tex_hf);
-        color4 = sp_tex_nearest4(u, v, passmask); /* bilinear added later */
+        color4 = do_bilin ? sp_tex_bilinear4(u, v, passmask)   /* 4 taps/lane */
+                          : sp_tex_nearest4(u, v, passmask);   /* 1 tap/lane  */
       } else {
         /* vertex color path: interpolate rgba, divide if persp, pack to RGBA8 */
         v128_t r = wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(w0,wasm_f32x4_splat(r0)),
