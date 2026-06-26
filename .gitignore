@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.DS_Store
+bench/_*.mjs
+bench/*.json
+/tmp/

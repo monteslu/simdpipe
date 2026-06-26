@@ -1,0 +1,43 @@
+{
+  "name": "simdpipe",
+  "version": "0.0.1",
+  "description": "Portable SIMD software rasterizer (WASM + 128-bit SIMD). Isomorphic Node + browser. A member of the Mesa -pipe family (softpipe/llvmpipe/lavapipe), built for speed by doing less work.",
+  "type": "module",
+  "main": "./lib/index.mjs",
+  "exports": {
+    ".": "./lib/index.mjs"
+  },
+  "files": [
+    "lib/",
+    "dist/simdpipe.mjs",
+    "dist/simdpipe.wasm",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bash src/build.sh",
+    "smoke": "node bench/smoke.mjs",
+    "bench": "node bench/run.mjs"
+  },
+  "keywords": [
+    "software-rasterizer",
+    "rasterizer",
+    "renderer",
+    "webgl",
+    "opengl",
+    "gl",
+    "wasm",
+    "webassembly",
+    "simd",
+    "graphics",
+    "framebuffer",
+    "isomorphic",
+    "llvmpipe",
+    "softpipe"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
