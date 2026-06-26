@@ -585,27 +585,103 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
   float *gu=g_gb_u,*gv=g_gb_v,*gr=g_gb_r,*gg=g_gb_g,*gb=g_gb_b,*ga=g_gb_a;
   uint8_t *gc=g_gb_cover; float *depthBuf=ctx->depth;
 
-  for (int y = miny; y < maxy; y++) {
-    float yc = (float)y + 0.5f;
-    for (int x = minx; x < maxx; x++) {
-      float xc = (float)x + 0.5f;
-      float w0 = A0*xc + B0*yc + C0;
-      float w1 = A1*xc + B1*yc + C1;
-      float w2 = A2*xc + B2*yc + C2;
-      if (w0 < 0 || w1 < 0 || w2 < 0) continue;
-      int idx = y*W + x;
-      float z = w0*v0->z + w1*v1->z + w2*v2->z;
-      if (do_depth) { if (z >= depthBuf[idx]) continue; }
-      float recip = 1.0f;
-      if (persp) { float iw = w0*iw0 + w1*iw1 + w2*iw2; recip = 1.0f/iw; }
-      gu[idx] = (w0*u0+w1*u1+w2*u2)*recip;
-      gv[idx] = (w0*vv0+w1*vv1+w2*vv2)*recip;
-      gr[idx] = (w0*r0+w1*r1+w2*r2)*recip;
-      gg[idx] = (w0*g0+w1*g1+w2*g2)*recip;
-      gb[idx] = (w0*b0+w1*b1+w2*b2)*recip;
-      ga[idx] = (w0*a0+w1*a1+w2*a2)*recip;
-      gc[idx] = 1;
-      if (do_depth) depthBuf[idx] = z;
+  /* SIMD + tiled traversal — same hierarchical reject/accept + coarse-depth as
+   * sp_draw_triangle (this path was the shade-bound bottleneck: 94% of frame in
+   * a scalar one-pixel loop). Writes 6 varying planes + a cover byte per lane. */
+  const int TILE = SP_RASTER_TILE;
+#ifdef SP_NO_ZTILE
+  int do_ztile = 0;
+#else
+  int do_ztile = do_depth && ctx->ztile != NULL;
+#endif
+  float *ztileBuf = ctx->ztile; int tilesW = ctx->tiles_w;
+  float Az = v0->z*A0 + v1->z*A1 + v2->z*A2;
+  float Bz = v0->z*B0 + v1->z*B1 + v2->z*B2;
+  float Cz = v0->z*C0 + v1->z*C1 + v2->z*C2;
+  const int zxpos = (Az >= 0.0f), zypos = (Bz >= 0.0f);
+  const int x0pos0=(A0>=0.0f),x0pos1=(A1>=0.0f),x0pos2=(A2>=0.0f);
+  const int y0pos0=(B0>=0.0f),y0pos1=(B1>=0.0f),y0pos2=(B2>=0.0f);
+
+  v128_t lane_off = wasm_f32x4_make(0.0f,1.0f,2.0f,3.0f);
+  v128_t zero4 = wasm_f32x4_splat(0.0f);
+  v128_t one4  = wasm_f32x4_splat(1.0f);
+  v128_t sX0=wasm_f32x4_splat(A0*4.0f),sX1=wasm_f32x4_splat(A1*4.0f),sX2=wasm_f32x4_splat(A2*4.0f);
+  v128_t A0l=wasm_f32x4_mul(wasm_f32x4_splat(A0),lane_off);
+  v128_t A1l=wasm_f32x4_mul(wasm_f32x4_splat(A1),lane_off);
+  v128_t A2l=wasm_f32x4_mul(wasm_f32x4_splat(A2),lane_off);
+  v128_t Z0s=wasm_f32x4_splat(v0->z),Z1s=wasm_f32x4_splat(v1->z),Z2s=wasm_f32x4_splat(v2->z);
+
+  for (int ty=miny; ty<maxy; ty+=TILE) {
+    int tyend=ty+TILE; if(tyend>maxy)tyend=maxy;
+    float ylo=(float)ty+0.5f, yhi=(float)(tyend-1)+0.5f;
+    for (int tx=minx; tx<maxx; tx+=TILE) {
+      int txend=tx+TILE; if(txend>maxx)txend=maxx;
+      float xlo=(float)tx+0.5f, xhi=(float)(txend-1)+0.5f;
+      float mx0=A0*(x0pos0?xhi:xlo)+B0*(y0pos0?yhi:ylo)+C0; if(mx0<0.0f)continue;
+      float mx1=A1*(x0pos1?xhi:xlo)+B1*(y0pos1?yhi:ylo)+C1; if(mx1<0.0f)continue;
+      float mx2=A2*(x0pos2?xhi:xlo)+B2*(y0pos2?yhi:ylo)+C2; if(mx2<0.0f)continue;
+      float mn0=A0*(x0pos0?xlo:xhi)+B0*(y0pos0?ylo:yhi)+C0;
+      float mn1=A1*(x0pos1?xlo:xhi)+B1*(y0pos1?ylo:yhi)+C1;
+      float mn2=A2*(x0pos2?xlo:xhi)+B2*(y0pos2?ylo:yhi)+C2;
+      int tile_full=(mn0>=0.0f&&mn1>=0.0f&&mn2>=0.0f);
+      int tileIdx=(ty/TILE)*tilesW+(tx/TILE);
+      float zmnT=Az*(zxpos?xlo:xhi)+Bz*(zypos?ylo:yhi)+Cz;
+      if(do_ztile && zmnT>ztileBuf[tileIdx]) continue;
+      float fminx=(float)tx+0.5f;
+      v128_t txmax4=wasm_f32x4_splat((float)txend);
+
+      for (int y=ty; y<tyend; y++) {
+        float yc=(float)y+0.5f;
+        float row0=A0*fminx+B0*yc+C0, row1=A1*fminx+B1*yc+C1, row2=A2*fminx+B2*yc+C2;
+        v128_t w0=wasm_f32x4_add(wasm_f32x4_splat(row0),A0l);
+        v128_t w1=wasm_f32x4_add(wasm_f32x4_splat(row1),A1l);
+        v128_t w2=wasm_f32x4_add(wasm_f32x4_splat(row2),A2l);
+        for (int x=tx; x<txend; x+=4,
+             w0=wasm_f32x4_add(w0,sX0),w1=wasm_f32x4_add(w1,sX1),w2=wasm_f32x4_add(w2,sX2)) {
+          v128_t inside;
+          if (tile_full) {
+            v128_t xabs=wasm_f32x4_add(wasm_f32x4_splat((float)x),lane_off);
+            inside=wasm_f32x4_lt(xabs,txmax4);
+          } else {
+            inside=wasm_v128_and(wasm_v128_and(wasm_f32x4_ge(w0,zero4),wasm_f32x4_ge(w1,zero4)),wasm_f32x4_ge(w2,zero4));
+            v128_t xabs=wasm_f32x4_add(wasm_f32x4_splat((float)x),lane_off);
+            inside=wasm_v128_and(inside,wasm_f32x4_lt(xabs,txmax4));
+            if(!wasm_v128_any_true(inside)) continue;
+          }
+          v128_t z=wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(w0,Z0s),wasm_f32x4_mul(w1,Z1s)),wasm_f32x4_mul(w2,Z2s));
+          int base=y*W+x;
+          v128_t pass=inside;
+          if (do_depth) {
+            v128_t zbuf=wasm_v128_load(depthBuf+base);
+            pass=wasm_v128_and(pass,wasm_f32x4_lt(z,zbuf));
+            if(!wasm_v128_any_true(pass)) continue;
+          }
+          /* interpolate the 6 varyings (persp-divide if needed) */
+          v128_t recip=one4;
+          if (persp) {
+            v128_t iw=wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(w0,wasm_f32x4_splat(iw0)),wasm_f32x4_mul(w1,wasm_f32x4_splat(iw1))),wasm_f32x4_mul(w2,wasm_f32x4_splat(iw2)));
+            recip=wasm_f32x4_div(one4,iw);
+          }
+          #define GB_INTERP(A_,B_,C_) wasm_f32x4_mul(wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(w0,wasm_f32x4_splat(A_)),wasm_f32x4_mul(w1,wasm_f32x4_splat(B_))),wasm_f32x4_mul(w2,wasm_f32x4_splat(C_))),recip)
+          v128_t U=GB_INTERP(u0,u1,u2), V=GB_INTERP(vv0,vv1,vv2);
+          v128_t R=GB_INTERP(r0,r1,r2), G=GB_INTERP(g0,g1,g2);
+          v128_t B=GB_INTERP(b0,b1,b2), A=GB_INTERP(a0,a1,a2);
+          #undef GB_INTERP
+          /* masked plane writes: keep existing where !pass (read-modify-write) */
+          #define GB_STORE(PLANE,VAL) wasm_v128_store(PLANE+base, wasm_v128_bitselect(VAL, wasm_v128_load(PLANE+base), pass))
+          GB_STORE(gu,U); GB_STORE(gv,V); GB_STORE(gr,R); GB_STORE(gg,G); GB_STORE(gb,B); GB_STORE(ga,A);
+          #undef GB_STORE
+          if (do_depth) wasm_v128_store(depthBuf+base, wasm_v128_bitselect(z, wasm_v128_load(depthBuf+base), pass));
+          /* cover byte per passing lane */
+          uint32_t pm=(uint32_t)wasm_i32x4_bitmask(pass);
+          int rem = txend - x; if (rem > 4) rem = 4;
+          for (int l=0;l<rem;l++) if (pm&(1u<<l)) gc[base+l]=1;
+        }
+      }
+      if (do_ztile && tile_full && do_depth) {
+        float zmxT=Az*(zxpos?xhi:xlo)+Bz*(zypos?yhi:ylo)+Cz;
+        if(zmxT<ztileBuf[tileIdx]) ztileBuf[tileIdx]=zmxT;
+      }
     }
   }
 }
