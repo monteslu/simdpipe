@@ -1,6 +1,6 @@
 {
   "name": "simdpipe",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Portable SIMD software rasterizer (WASM + 128-bit SIMD). Isomorphic Node + browser. A member of the Mesa -pipe family (softpipe/llvmpipe/lavapipe), built for speed by doing less work.",
   "type": "module",
   "main": "./lib/index.mjs",
@@ -13,6 +13,7 @@
     "dist/simdpipe.wasm",
     "dist/simdpipe-threads.mjs",
     "dist/simdpipe-threads.wasm",
+    "examples/",
     "src/",
     "README.md",
     "LICENSE"
@@ -23,7 +24,11 @@
     "bench": "node bench/run.mjs",
     "bench:threads": "node bench/threads.mjs",
     "bench:jit": "node bench/jit-spike.mjs",
-    "bench:jit-simd": "node bench/jit-simd-spike.mjs"
+    "bench:jit-simd": "node bench/jit-simd-spike.mjs",
+    "bench:fidelity": "node bench/fidelity.mjs",
+    "cube": "node bench/cube.mjs",
+    "program": "node bench/program-test.mjs",
+    "test": "node bench/smoke.mjs && node bench/program-test.mjs && node bench/cube.mjs"
   },
   "keywords": [
     "software-rasterizer",

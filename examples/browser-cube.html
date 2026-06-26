@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>simdpipe — spinning textured cube (browser)</title>
+<style>
+  body { margin: 0; background: #0b0d12; color: #cdd; font: 14px/1.5 system-ui, sans-serif;
+         display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 24px; }
+  canvas { image-rendering: pixelated; border: 1px solid #233; width: 512px; height: 512px; background:#000; }
+  .row { display: flex; gap: 16px; align-items: center; }
+  code { color: #8cf; }
+  #fps { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+  <h2>simdpipe — software-rasterized cube, in the browser</h2>
+  <p>Same WASM module as Node. Rasterized on the CPU, presented via canvas. <span id="fps">…</span></p>
+  <canvas id="c" width="256" height="256"></canvas>
+  <div class="row">
+    <label><input type="checkbox" id="bilinear" checked> bilinear</label>
+    <label><input type="checkbox" id="persp" checked> perspective-correct</label>
+    <span>fidelity knobs — toggle and watch fps</span>
+  </div>
+
+  <script type="module">
+    import { createGL } from '../lib/gl.mjs';
+    import { shaders } from '../lib/program.mjs';
+    import { FLAGS } from '../lib/index.mjs';
+
+    const W = 256, H = 256;
+    const gl = await createGL({ width: W, height: H });
+
+    // checker texture
+    const TW = 8, TH = 8;
+    const tex = new Uint32Array(TW * TH);
+    for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++)
+      tex[y*TW+x] = ((x+y)&1) ? 0xfff0a020 : 0xff2040f0;
+    gl.useProgram(shaders.texturedModulate(tex, TW, TH));
+
+    // cube geometry (interleaved: x y z  r g b  u v)
+    const S = 1;
+    const v = [[-S,-S,-S],[S,-S,-S],[S,S,-S],[-S,S,-S],[-S,-S,S],[S,-S,S],[S,S,S],[-S,S,S]];
+    const uv = [[0,0],[1,0],[1,1],[0,1]];
+    const arr = [];
+    const quad = (a,b,c,d,tint) => { const cs=[a,b,c,d]; for (const tr of [[0,1,2],[0,2,3]]) for (const ci of tr) arr.push(...cs[ci], ...tint, ...uv[ci]); };
+    quad(v[4],v[5],v[6],v[7],[1,.6,.6]); quad(v[1],v[0],v[3],v[2],[.6,1,.6]);
+    quad(v[0],v[4],v[7],v[3],[.6,.6,1]); quad(v[5],v[1],v[2],v[6],[1,1,.6]);
+    quad(v[7],v[6],v[2],v[3],[1,.6,1]); quad(v[0],v[1],v[5],v[4],[.6,1,1]);
+    const attribs = new Float32Array(arr), stride = 8, layout = { pos:0, color:3, uv:6 }, count = arr.length/stride;
+    const proj = gl.mat4.perspective(Math.PI/4, W/H, 0.1, 100);
+
+    // present via canvas ImageData
+    const cv = document.getElementById('c'); cv.width = W; cv.height = H;
+    const ctx = cv.getContext('2d');
+    const img = new ImageData(W, H);
+
+    const bil = document.getElementById('bilinear'), per = document.getElementById('persp');
+    const fpsEl = document.getElementById('fps');
+    let last = performance.now(), frames = 0, fps = 0;
+
+    function loop(t) {
+      let f = FLAGS.DEPTH_TEST | FLAGS.TEXTURE;
+      if (bil.checked) f |= FLAGS.BILINEAR;
+      if (per.checked) f |= FLAGS.PERSP_CORRECT;
+      gl.setFlags(f);
+      gl.clear();
+      let mv = gl.mat4.identity();
+      mv = gl.mat4.translate(mv, 0, 0, -4);
+      mv = gl.mat4.rotateY(mv, t * 0.001);
+      mv = gl.mat4.rotateX(mv, t * 0.0006);
+      gl.setMVP(gl.mat4.multiply(proj, mv));
+      gl.drawArrays(attribs, stride, layout, count);
+
+      img.data.set(gl.getImageData());
+      ctx.putImageData(img, 0, 0);
+
+      frames++;
+      if (t - last > 500) { fps = frames * 1000 / (t - last); frames = 0; last = t; fpsEl.textContent = `${fps.toFixed(0)} fps`; }
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
