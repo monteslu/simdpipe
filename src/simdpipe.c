@@ -295,6 +295,21 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
   v128_t A1lane = wasm_f32x4_mul(wasm_f32x4_splat(A1), lane_offset);
   v128_t A2lane = wasm_f32x4_mul(wasm_f32x4_splat(A2), lane_offset);
 
+  /* Factored barycentric interpolation: since w0+w1+w2==1, any attribute is
+   * a == a2 + w0*(a0-a2) + w1*(a1-a2) — 2 muls/2 adds per channel instead of 3/2,
+   * and w2 isn't needed for interpolation. Splat the base (v2) and the two deltas
+   * once per triangle. (Saves ~1 mul per channel per shaded group.) */
+  v128_t cR2=wasm_f32x4_splat(r2), Rd0=wasm_f32x4_splat(r0-r2), Rd1=wasm_f32x4_splat(r1-r2);
+  v128_t cG2=wasm_f32x4_splat(g2), Gd0=wasm_f32x4_splat(g0-g2), Gd1=wasm_f32x4_splat(g1-g2);
+  v128_t cB2=wasm_f32x4_splat(b2), Bd0=wasm_f32x4_splat(b0-b2), Bd1=wasm_f32x4_splat(b1-b2);
+  v128_t cA2=wasm_f32x4_splat(a2), Ad0=wasm_f32x4_splat(a0-a2), Ad1=wasm_f32x4_splat(a1-a2);
+  v128_t IW2=wasm_f32x4_splat(iw2), IWd0=wasm_f32x4_splat(iw0-iw2), IWd1=wasm_f32x4_splat(iw1-iw2);
+  v128_t U2=wasm_f32x4_splat(u2), Ud0=wasm_f32x4_splat(u0-u2), Ud1=wasm_f32x4_splat(u1-u2);
+  v128_t V2=wasm_f32x4_splat(vv2), Vd0=wasm_f32x4_splat(vv0-vv2), Vd1=wasm_f32x4_splat(vv1-vv2);
+  v128_t Z2v=wasm_f32x4_splat(v2->z), Zd0=wasm_f32x4_splat(v0->z - v2->z), Zd1=wasm_f32x4_splat(v1->z - v2->z);
+  /* a == base + w0*d0 + w1*d1 */
+  #define SP_LERP(base,d0,d1) wasm_f32x4_add(base, wasm_f32x4_add(wasm_f32x4_mul(w0,d0), wasm_f32x4_mul(w1,d1)))
+
   uint32_t *colorBuf = ctx->color;
   float *depthBuf = ctx->depth;
 
@@ -424,11 +439,9 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
         if (!wasm_v128_any_true(inside)) continue;
       }
 
-      /* interpolate depth (always linear in screen space) */
-      v128_t z = wasm_f32x4_add(
-                   wasm_f32x4_add(wasm_f32x4_mul(w0, wasm_f32x4_splat(v0->z)),
-                                  wasm_f32x4_mul(w1, wasm_f32x4_splat(v1->z))),
-                   wasm_f32x4_mul(w2, wasm_f32x4_splat(v2->z)));
+      /* interpolate depth (always linear in screen space; factored — runs for
+       * every group incl. depth-rejected ones, so the saved mul matters most here) */
+      v128_t z = SP_LERP(Z2v, Zd0, Zd1);
 
       int base = y * W + x;
       v128_t passmask = inside;
@@ -445,19 +458,10 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
       /* recover 1/invw for perspective division */
       v128_t color4;
       if (do_tex) {
-        v128_t u = wasm_f32x4_add(
-                     wasm_f32x4_add(wasm_f32x4_mul(w0, wasm_f32x4_splat(u0)),
-                                    wasm_f32x4_mul(w1, wasm_f32x4_splat(u1))),
-                     wasm_f32x4_mul(w2, wasm_f32x4_splat(u2)));
-        v128_t v = wasm_f32x4_add(
-                     wasm_f32x4_add(wasm_f32x4_mul(w0, wasm_f32x4_splat(vv0)),
-                                    wasm_f32x4_mul(w1, wasm_f32x4_splat(vv1))),
-                     wasm_f32x4_mul(w2, wasm_f32x4_splat(vv2)));
+        v128_t u = SP_LERP(U2, Ud0, Ud1);
+        v128_t v = SP_LERP(V2, Vd0, Vd1);
         if (persp) {
-          v128_t iw = wasm_f32x4_add(
-                        wasm_f32x4_add(wasm_f32x4_mul(w0, wasm_f32x4_splat(iw0)),
-                                       wasm_f32x4_mul(w1, wasm_f32x4_splat(iw1))),
-                        wasm_f32x4_mul(w2, wasm_f32x4_splat(iw2)));
+          v128_t iw = SP_LERP(IW2, IWd0, IWd1);
           v128_t rw = wasm_f32x4_div(wasm_f32x4_splat(1.0f), iw);
           u = wasm_f32x4_mul(u, rw);
           v = wasm_f32x4_mul(v, rw);
@@ -468,23 +472,13 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
         color4 = do_bilin ? sp_tex_bilinear4(u, v, passmask)   /* 4 taps/lane */
                           : sp_tex_nearest4(u, v, passmask);   /* 1 tap/lane  */
       } else {
-        /* vertex color path: interpolate rgba, divide if persp, pack to RGBA8 */
-        v128_t r = wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(w0,wasm_f32x4_splat(r0)),
-                                                 wasm_f32x4_mul(w1,wasm_f32x4_splat(r1))),
-                                  wasm_f32x4_mul(w2,wasm_f32x4_splat(r2)));
-        v128_t g = wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(w0,wasm_f32x4_splat(g0)),
-                                                 wasm_f32x4_mul(w1,wasm_f32x4_splat(g1))),
-                                  wasm_f32x4_mul(w2,wasm_f32x4_splat(g2)));
-        v128_t b = wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(w0,wasm_f32x4_splat(b0)),
-                                                 wasm_f32x4_mul(w1,wasm_f32x4_splat(b1))),
-                                  wasm_f32x4_mul(w2,wasm_f32x4_splat(b2)));
-        v128_t a = wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(w0,wasm_f32x4_splat(a0)),
-                                                 wasm_f32x4_mul(w1,wasm_f32x4_splat(a1))),
-                                  wasm_f32x4_mul(w2,wasm_f32x4_splat(a2)));
+        /* vertex color path: interpolate rgba (factored), divide if persp, pack */
+        v128_t r = SP_LERP(cR2, Rd0, Rd1);
+        v128_t g = SP_LERP(cG2, Gd0, Gd1);
+        v128_t b = SP_LERP(cB2, Bd0, Bd1);
+        v128_t a = SP_LERP(cA2, Ad0, Ad1);
         if (persp) {
-          v128_t iw = wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(w0,wasm_f32x4_splat(iw0)),
-                                                    wasm_f32x4_mul(w1,wasm_f32x4_splat(iw1))),
-                                     wasm_f32x4_mul(w2,wasm_f32x4_splat(iw2)));
+          v128_t iw = SP_LERP(IW2, IWd0, IWd1);
           v128_t rw = wasm_f32x4_div(wasm_f32x4_splat(1.0f), iw);
           r=wasm_f32x4_mul(r,rw); g=wasm_f32x4_mul(g,rw); b=wasm_f32x4_mul(b,rw); a=wasm_f32x4_mul(a,rw);
         }
