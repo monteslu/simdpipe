@@ -15,7 +15,7 @@ emcc simdpipe.c \
   -s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 \
   -s ENVIRONMENT=node,web,worker \
   -s ALLOW_MEMORY_GROWTH=1 -s INITIAL_MEMORY=67108864 \
-  -s EXPORTED_RUNTIME_METHODS='["HEAPU8","HEAPU32","HEAPF32","cwrap","ccall"]' \
+  -s EXPORTED_RUNTIME_METHODS='["HEAPU8","HEAPU32","HEAPF32","wasmMemory","cwrap","ccall"]' \
   -s EXPORTED_FUNCTIONS="$COMMON_EXPORTS" \
   -o "$OUT/simdpipe.mjs"
 

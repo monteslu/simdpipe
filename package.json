@@ -28,7 +28,9 @@
     "bench:fidelity": "node bench/fidelity.mjs",
     "cube": "node bench/cube.mjs",
     "program": "node bench/program-test.mjs",
-    "test": "node bench/smoke.mjs && node bench/program-test.mjs && node bench/cube.mjs"
+    "glsl": "node bench/glsl-test.mjs",
+    "jit-shader": "node bench/jit-shader-test.mjs",
+    "test": "node bench/smoke.mjs && node bench/program-test.mjs && node bench/glsl-test.mjs && node bench/jit-shader-test.mjs && node bench/cube.mjs"
   },
   "keywords": [
     "software-rasterizer",
