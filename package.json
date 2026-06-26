@@ -21,7 +21,9 @@
     "build": "bash src/build.sh",
     "smoke": "node bench/smoke.mjs",
     "bench": "node bench/run.mjs",
-    "bench:threads": "node bench/threads.mjs"
+    "bench:threads": "node bench/threads.mjs",
+    "bench:jit": "node bench/jit-spike.mjs",
+    "bench:jit-simd": "node bench/jit-simd-spike.mjs"
   },
   "keywords": [
     "software-rasterizer",
