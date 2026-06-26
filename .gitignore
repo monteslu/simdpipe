@@ -5,3 +5,9 @@ bench/_*.mjs
 bench/*.json
 /tmp/
 bench/cube.ppm
+# compete: build artifacts + machine-specific output (regenerable via npm run compete)
+bench/compete/native-raster
+bench/compete/results.json
+bench/compete/shots/
+*.rgba
+*.bin

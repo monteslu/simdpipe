@@ -32,6 +32,8 @@
     "glsl": "node bench/glsl-test.mjs",
     "jit-shader": "node bench/jit-shader-test.mjs",
     "jit-texture": "node bench/jit-texture-test.mjs",
+    "compete": "node bench/compete/run-all.mjs",
+    "compete:build-native": "gcc -O3 -march=native -o bench/compete/native-raster bench/compete/native-raster.c -lm",
     "test": "node bench/smoke.mjs && node bench/program-test.mjs && node bench/glsl-test.mjs && node bench/jit-shader-test.mjs && node bench/jit-texture-test.mjs && node bench/cube.mjs"
   },
   "keywords": [
