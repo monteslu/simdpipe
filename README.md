@@ -133,10 +133,15 @@ threads   ms     speedup
 24         7.2    4.96x
 ```
 
-Near-linear to ~4 cores; the tail is load imbalance (spatial triangle clustering)
-+ per-frame clear/spawn overhead, addressed by finer tiled binning later. **SIMD
-(~2.7×) × threads (~5×) stacks to roughly an order of magnitude over scalar JS on
-fill-bound work.** All numbers are machine-dependent — run them yourself.
+A **persistent worker pool** (`npm run bench:pool`) goes further: created once,
+with atomic tile-row dispatch (work-stealing, so uneven scenes load-balance) and
+no per-frame thread spawn. On a heavy fill-bound frame it hits **5.0× over serial**
+and beats the per-frame band spawn — with **bit-identical** output. (Threading
+only helps on substantial frames; pooled draws fall back to serial below a small
+work threshold, since WASM barrier sync isn't free on trivial frames.)
+
+**SIMD (~2.7×) × threads (~5×) stacks to roughly an order of magnitude over scalar
+JS on fill-bound work.** All numbers are machine-dependent — run them yourself.
 
 ### Fidelity ladder — "trade fidelity for speed", quantified
 
@@ -154,14 +159,32 @@ cheapest: affine vertex color               116     3.51x
 Bilinear→nearest alone is ~2×; the full ladder ~3.5×. **That's the whole thesis:**
 each knob you turn off buys speed — pick your point on the curve.
 
-### Runtime shader JIT (Tier-1) — yes, in WASM
+### Runtime shader JIT (Tier-1) — real GLSL, compiled to native SIMD
 
-`npm run bench:jit-simd` proves the part everyone says is impossible: we **generate
-WASM bytes at runtime**, the host engine (V8) **compiles them to native machine
-code** (~0.001 ms warm), and the result is exact. A generated **SIMD** kernel beats
-scalar JS **2.5–3.9×** on shader-like ALU workloads — the win JS can't express.
-(`lib/wasm-emit.mjs` is a tiny WASM binary encoder; you don't make memory
-executable yourself — the engine does it for you.)
+You author a GLSL-ish fragment shader; simdpipe parses it to an IR and **emits a
+SIMD WASM kernel at runtime**, which the host engine (V8) **compiles to native
+machine code** (~0.001 ms warm). The part everyone says is impossible — JIT in
+WASM — done: you don't make memory executable yourself, the engine does it for you
+(`lib/wasm-emit.mjs` is a tiny WASM binary encoder).
+
+```js
+const prog = gl.createJITProgram(`
+  uniform float t;
+  void main(){
+    float w = 0.5 + 0.5*sin(uv.x*12.0 + t);
+    gl_FragColor = vec4(mix(color.rgb, vec3(w, 0.0, 1.0), 0.5), 1.0);
+  }`);
+console.log(prog.jit); // true → native SIMD kernel (false → JS fallback, e.g. texture())
+gl.useProgram(prog);
+```
+
+`npm run jit-shader` runs a JIT'd procedural shader against the JS backend (the
+correctness oracle): **max channel delta 1** (rounding), and **~93× faster** than
+the per-pixel JS shader (0.22 ms vs 20.6 ms @ 128²). Supported in the JIT: `uv`,
+`color`, uniforms, `vecN`, swizzles, `+ - * /`, and `sin cos abs floor fract sqrt
+min max clamp mix step mod`. `texture()` shaders fall back to the JS backend
+(WASM has no gather). `npm run bench:jit-simd` shows the raw kernel win (2.5–3.9×
+over scalar JS on ALU-heavy work).
 
 > Honest scope: simdpipe does **not** try to beat a real GPU on raw fill rate, or
 > a native AVX-512 `llvmpipe` at equal fidelity — those are physically out of reach
@@ -172,13 +195,13 @@ executable yourself — the engine does it for you.)
 ## Roadmap
 
 - [x] SIMD edge-function rasterizer core, z-buffer, vertex color + nearest/bilinear textures, fidelity flags, benchmarks
-- [x] Threads — band-parallel rasterization (bit-identical output, ~5× on 24 cores)
+- [x] Threads — band-parallel + a **persistent work-stealing pool** (bit-identical, ~5× on 24 cores)
 - [x] Programmable fragment shaders (Tier-2) — varying G-buffer + JS shaders
-- [x] Runtime WASM-module shader JIT (Tier-1) — generate bytes, engine compiles to native; SIMD codegen beats scalar JS 2.5–3.9×
+- [x] **GLSL → IR → Tier-1 WASM JIT** — author real shaders; engine compiles to native SIMD (~93× over the JS shader)
 - [x] GL-shaped front end — MVP transform, vertex stage, `drawArrays`, spinning textured cube
 - [x] Fidelity ladder — bilinear/nearest, perspective/affine, texture/flat (~3.5× span)
-- [ ] Tiled binning + a persistent worker pool (better load balance than bands)
-- [ ] GLSL → IR front end feeding the Tier-1 JIT (compile real shaders, not hand-built kernels)
+- [ ] True per-tile binning (setup once, bin to overlapped tiles) for setup-bound scenes
+- [ ] JIT texture sampling (swizzled tiles; today texture() shaders use the JS backend)
 - [ ] Conformant WebGL2 / GL ES 3.0 API surface
 - [ ] More fidelity knobs (MSAA off + post-AA, fp16, fast-math, RGB565, …)
 
