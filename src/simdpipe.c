@@ -318,6 +318,11 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
    * pool's small-frame fallback) gets the win, banded workers skip it. */
   int do_ztile = do_depth && ctx->ztile != NULL
                  && tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h;
+  /* Small triangles (bbox within one tile) don't benefit from the coarse grid and
+   * would only pay its alignment + per-cell overhead. Skip ztile for them: not
+   * updating/rejecting is always conservative-safe, and it lets the tile loop use
+   * tight bbox-origin tiles (no grid snap) — a big win on tiny-triangle scenes. */
+  if ((maxx - minx) <= SP_RASTER_TILE && (maxy - miny) <= SP_RASTER_TILE) do_ztile = 0;
 #ifdef SP_FORCE_NO_ZTILE
   do_ztile = 0;
 #endif
@@ -336,10 +341,11 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
   const int x0pos0 = (A0 >= 0.0f), x0pos1 = (A1 >= 0.0f), x0pos2 = (A2 >= 0.0f);
   const int y0pos0 = (B0 >= 0.0f), y0pos1 = (B1 >= 0.0f), y0pos2 = (B2 >= 0.0f);
 
-  /* Tiles MUST be aligned to the ztile grid (start at floor(min/TILE)*TILE), or
-   * two triangles with different bbox origins would map misaligned tiles to the
-   * same ztile cell — corrupting the depth pyramid. We snap the loop to the grid
-   * and clamp each tile's processed pixel range to the triangle's bbox. */
+  /* Tiles are ALWAYS snapped to the grid (start at floor(min/TILE)*TILE) and the
+   * processed range clamped to the bbox. This keeps the per-pixel edge stepping
+   * origin identical whether or not ztile is active, so coarse-depth is provably
+   * output-invariant (ztile-on == ztile-off, byte for byte). Grid snap is also
+   * required for ztile-cell correctness when it IS active. */
   int tyStart = (miny / TILE) * TILE;
   int txStart = (minx / TILE) * TILE;
   for (int tyB = tyStart; tyB < maxy; tyB += TILE) {
@@ -637,6 +643,10 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
    * pool workers share one ztile and would race — see sp_draw_triangle. */
   int do_ztile = do_depth && ctx->ztile != NULL
                  && tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h;
+  if ((maxx - minx) <= SP_RASTER_TILE && (maxy - miny) <= SP_RASTER_TILE) do_ztile = 0;
+#ifdef SP_FORCE_NO_ZTILE
+  do_ztile = 0;
+#endif
   float *ztileBuf = ctx->ztile; int tilesW = ctx->tiles_w;
   float Az = v0->z*A0 + v1->z*A1 + v2->z*A2;
   float Bz = v0->z*B0 + v1->z*B1 + v2->z*B2;
@@ -654,8 +664,9 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
   v128_t A2l=wasm_f32x4_mul(wasm_f32x4_splat(A2),lane_off);
   v128_t Z0s=wasm_f32x4_splat(v0->z),Z1s=wasm_f32x4_splat(v1->z),Z2s=wasm_f32x4_splat(v2->z);
 
-  /* tiles aligned to the ztile grid (see sp_draw_triangle) */
-  int tyStart=(miny/TILE)*TILE, txStart=(minx/TILE)*TILE;
+  /* always grid-snapped (see sp_draw_triangle) — output-invariant + ztile-safe */
+  int tyStart = (miny/TILE)*TILE;
+  int txStart = (minx/TILE)*TILE;
   for (int tyB=tyStart; tyB<maxy; tyB+=TILE) {
     int ty = tyB<miny?miny:tyB;
     int tyend=tyB+TILE; if(tyend>maxy)tyend=maxy;
