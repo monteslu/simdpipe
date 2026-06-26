@@ -174,17 +174,27 @@ const prog = gl.createJITProgram(`
     float w = 0.5 + 0.5*sin(uv.x*12.0 + t);
     gl_FragColor = vec4(mix(color.rgb, vec3(w, 0.0, 1.0), 0.5), 1.0);
   }`);
-console.log(prog.jit); // true → native SIMD kernel (false → JS fallback, e.g. texture())
+console.log(prog.jit); // true → native SIMD kernel
 gl.useProgram(prog);
+
+// texture() too — sampled straight from linear memory in the kernel:
+const texProg = gl.createJITProgram(
+  `void main(){ gl_FragColor = texture(uv) * color; }`,
+  { bilinear: true } // or omit for nearest (1 tap)
+);
 ```
 
 `npm run jit-shader` runs a JIT'd procedural shader against the JS backend (the
 correctness oracle): **max channel delta 1** (rounding), and **~93× faster** than
 the per-pixel JS shader (0.22 ms vs 20.6 ms @ 128²). Supported in the JIT: `uv`,
-`color`, uniforms, `vecN`, swizzles, `+ - * /`, and `sin cos abs floor fract sqrt
-min max clamp mix step mod`. `texture()` shaders fall back to the JS backend
-(WASM has no gather). `npm run bench:jit-simd` shows the raw kernel win (2.5–3.9×
-over scalar JS on ALU-heavy work).
+`color`, uniforms, `vecN`, swizzles, `+ - * /`, `sin cos abs floor fract sqrt min
+max clamp mix step mod`, **and `texture()`** — nearest or bilinear. WASM has no
+SIMD gather opcode, but a gather is just *N address computes + N scalar loads*,
+which the kernel does by hand and reassembles into lanes; nothing that is pure
+calculation falls back to JS. `npm run jit-texture` validates JIT texture
+sampling against the JS oracle (**max delta 1**, ~31× faster than the JS shader;
+bilinear's 4 taps cost only ~27% over nearest). `npm run bench:jit-simd` shows
+the raw ALU kernel win (2.5–3.9× over scalar JS).
 
 > Honest scope: simdpipe does **not** try to beat a real GPU on raw fill rate, or
 > a native AVX-512 `llvmpipe` at equal fidelity — those are physically out of reach
@@ -198,10 +208,11 @@ over scalar JS on ALU-heavy work).
 - [x] Threads — band-parallel + a **persistent work-stealing pool** (bit-identical, ~5× on 24 cores)
 - [x] Programmable fragment shaders (Tier-2) — varying G-buffer + JS shaders
 - [x] **GLSL → IR → Tier-1 WASM JIT** — author real shaders; engine compiles to native SIMD (~93× over the JS shader)
+- [x] **JIT texture sampling** — `texture()` compiles to an in-kernel SIMD gather (nearest + bilinear); no JS fallback, validated vs the oracle (~31× over the JS shader)
 - [x] GL-shaped front end — MVP transform, vertex stage, `drawArrays`, spinning textured cube
 - [x] Fidelity ladder — bilinear/nearest, perspective/affine, texture/flat (~3.5× span)
 - [ ] True per-tile binning (setup once, bin to overlapped tiles) for setup-bound scenes
-- [ ] JIT texture sampling (swizzled tiles; today texture() shaders use the JS backend)
+- [ ] Swizzled/tiled texture layout (cache-locality win over the linear gather)
 - [ ] Conformant WebGL2 / GL ES 3.0 API surface
 - [ ] More fidelity knobs (MSAA off + post-AA, fp16, fast-math, RGB565, …)
 
