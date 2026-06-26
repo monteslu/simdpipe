@@ -47,7 +47,7 @@ enum {
 /* Rasterizer tile size (pixels). Used for hierarchical reject/accept AND the
  * coarse per-tile Zmax depth-rejection grid, so it's a file-level constant. */
 #ifndef SP_RASTER_TILE
-#define SP_RASTER_TILE 8    /* swept: 8 wins balanced+shade+small; 16 better only for pure big-tri fill */
+#define SP_RASTER_TILE 16   /* swept w/ correct coarse-depth: 16 best overall */
 #endif
 
 /* ---- renderer state ---- */
@@ -311,10 +311,15 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
    * On top of geometric reject/accept, a coarse Zmax test skips tiles where the
    * triangle is fully occluded (its min depth in the tile > the tile's Zmax). */
   const int TILE = SP_RASTER_TILE;
-#ifdef SP_NO_ZTILE
-  int do_ztile = 0;
-#else
-  int do_ztile = do_depth && ctx->ztile != NULL;
+  /* Coarse-depth is safe only when THIS call owns the whole framebuffer height
+   * (serial / single-thread fallback). Banded pool workers each see a y-slice and
+   * share one g_ctx.ztile; gating on full-screen ownership keeps the grid
+   * single-writer without a compile-time switch — the serial path (incl. the
+   * pool's small-frame fallback) gets the win, banded workers skip it. */
+  int do_ztile = do_depth && ctx->ztile != NULL
+                 && tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h;
+#ifdef SP_FORCE_NO_ZTILE
+  do_ztile = 0;
 #endif
   float * ztileBuf = ctx->ztile;
   int tilesW = ctx->tiles_w;
@@ -331,11 +336,21 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
   const int x0pos0 = (A0 >= 0.0f), x0pos1 = (A1 >= 0.0f), x0pos2 = (A2 >= 0.0f);
   const int y0pos0 = (B0 >= 0.0f), y0pos1 = (B1 >= 0.0f), y0pos2 = (B2 >= 0.0f);
 
-  for (int ty = miny; ty < maxy; ty += TILE) {
-    int tyend = ty + TILE; if (tyend > maxy) tyend = maxy;
+  /* Tiles MUST be aligned to the ztile grid (start at floor(min/TILE)*TILE), or
+   * two triangles with different bbox origins would map misaligned tiles to the
+   * same ztile cell — corrupting the depth pyramid. We snap the loop to the grid
+   * and clamp each tile's processed pixel range to the triangle's bbox. */
+  int tyStart = (miny / TILE) * TILE;
+  int txStart = (minx / TILE) * TILE;
+  for (int tyB = tyStart; tyB < maxy; tyB += TILE) {
+    int ty = tyB < miny ? miny : tyB;            /* clamp processed range to bbox */
+    int tyend = tyB + TILE; if (tyend > maxy) tyend = maxy;
+    if (ty >= tyend) continue;
     float ylo = (float)ty + 0.5f, yhi = (float)(tyend - 1) + 0.5f;
-    for (int tx = minx; tx < maxx; tx += TILE) {
-      int txend = tx + TILE; if (txend > maxx) txend = maxx;
+    for (int txB = txStart; txB < maxx; txB += TILE) {
+      int tx = txB < minx ? minx : txB;          /* clamp processed range to bbox */
+      int txend = txB + TILE; if (txend > maxx) txend = maxx;
+      if (tx >= txend) continue;
       float xlo = (float)tx + 0.5f, xhi = (float)(txend - 1) + 0.5f;
 
       /* reject: edge at its MAX corner < 0  → tile fully outside */
@@ -355,9 +370,18 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
       /* coarse depth reject: tightest triangle z over this tile is at the z-min
        * corner. If even that is farther than everything already in the tile, the
        * whole triangle is occluded here — skip without touching a single pixel. */
-      int tileIdx = (ty / TILE) * tilesW + (tx / TILE);
+      int tileIdx = (tyB / TILE) * tilesW + (txB / TILE);  /* aligned grid cell */
       float zminTile = Az * (zxpos ? xlo : xhi) + Bz * (zypos ? ylo : yhi) + Cz;
+#ifndef SP_ZTILE_NO_REJECT
       if (do_ztile && zminTile > ztileBuf[tileIdx]) continue;
+#endif
+      /* Track the ACTUAL max depth written in this tile (not the tile_full corner
+       * estimate — that's an FP false-positive at edges: a triangle marked "full"
+       * can leave uncovered pixels at clear depth while the corner Zmax dips below
+       * them, causing later visible triangles to be wrongly rejected). Start at
+       * -inf; max in each passing lane's z; commit to ztile at tile end. */
+      v128_t tileZmaxAcc = wasm_f32x4_splat(-1.0e30f);
+      int tileWrote = 0;
 
       float fminx = (float)tx + 0.5f;
       v128_t txmax4 = wasm_f32x4_splat((float)txend);
@@ -501,21 +525,41 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
       if (do_depth) {
         v128_t newz = wasm_v128_bitselect(z, wasm_v128_load(depthBuf + base), passmask);
         wasm_v128_store(depthBuf + base, newz);
+        /* fold this group's passing z into the tile's running max (only when the
+         * coarse pyramid is active; non-passing lanes forced to -inf) */
+        if (do_ztile) tileZmaxAcc = wasm_f32x4_max(tileZmaxAcc, wasm_v128_bitselect(z, wasm_f32x4_splat(-1.0e30f), passmask));
       }
 
       /* count shaded lanes */
-      ctx->frag_shaded += (uint64_t)(__builtin_popcount(wasm_i32x4_bitmask(passmask)));
+      int wl = __builtin_popcount(wasm_i32x4_bitmask(passmask));
+      ctx->frag_shaded += (uint64_t)wl;
+      if (do_ztile) tileWrote += wl;
     }
   }
-      /* coarse Zmax update: after a fully-covering opaque triangle, nothing in
-       * the tile is farther than the triangle's farthest covered point (kept
-       * existing pixels only ever passed the depth test by being closer). So we
-       * may safely lower the tile Zmax to the triangle's z-max over the tile.
-       * Blend keeps dst visible, so skip the update when blending. */
-      if (do_ztile && tile_full && !do_blend) {
-        float zmaxTile = Az * (zxpos ? xhi : xlo) + Bz * (zypos ? yhi : ylo) + Cz;
-        if (zmaxTile < ztileBuf[tileIdx]) ztileBuf[tileIdx] = zmaxTile;
+      /* coarse Zmax update — CORRECT version: commit the tile's farthest written
+       * depth to the pyramid only when THIS triangle wrote EVERY pixel of the
+       * tile (verified by a written-lane count == tile area, not the FP-fragile
+       * tile_full corner test). When fully written, every pixel is this triangle's
+       * z, so the tracked max IS the true tile max and there are no stale/uncovered
+       * pixels to wrongly occlude later geometry. Blend keeps dst, so skip then. */
+#ifndef SP_ZTILE_NO_UPDATE
+      /* Only when this triangle covered the WHOLE, UNCLIPPED grid cell (the full
+       * TILE×TILE region — not clipped by bbox/screen) AND wrote every one of its
+       * pixels: then every pixel of the cell is this triangle's z, so the tracked
+       * max is the true cell Zmax with no stale/uncovered pixels. A bbox-clipped
+       * cell has out-of-bbox pixels at old depth, so we must NOT lower its Zmax. */
+      if (do_ztile && do_depth && !do_blend
+          && tx == txB && (txend - txB) == TILE
+          && ty == tyB && (tyend - tyB) == TILE
+          && tileWrote == TILE * TILE) {
+        float m0 = wasm_f32x4_extract_lane(tileZmaxAcc, 0);
+        float m1 = wasm_f32x4_extract_lane(tileZmaxAcc, 1);
+        float m2 = wasm_f32x4_extract_lane(tileZmaxAcc, 2);
+        float m3 = wasm_f32x4_extract_lane(tileZmaxAcc, 3);
+        float mx = m0 > m1 ? m0 : m1; float mx2 = m2 > m3 ? m2 : m3; mx = mx > mx2 ? mx : mx2;
+        if (mx < ztileBuf[tileIdx]) ztileBuf[tileIdx] = mx;
       }
+#endif
     } /* tile x */
   }   /* tile y */
 }
@@ -589,11 +633,10 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
    * sp_draw_triangle (this path was the shade-bound bottleneck: 94% of frame in
    * a scalar one-pixel loop). Writes 6 varying planes + a cover byte per lane. */
   const int TILE = SP_RASTER_TILE;
-#ifdef SP_NO_ZTILE
-  int do_ztile = 0;
-#else
-  int do_ztile = do_depth && ctx->ztile != NULL;
-#endif
+  /* coarse-depth only when this call owns the whole height (serial path); banded
+   * pool workers share one ztile and would race — see sp_draw_triangle. */
+  int do_ztile = do_depth && ctx->ztile != NULL
+                 && tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h;
   float *ztileBuf = ctx->ztile; int tilesW = ctx->tiles_w;
   float Az = v0->z*A0 + v1->z*A1 + v2->z*A2;
   float Bz = v0->z*B0 + v1->z*B1 + v2->z*B2;
@@ -611,11 +654,17 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
   v128_t A2l=wasm_f32x4_mul(wasm_f32x4_splat(A2),lane_off);
   v128_t Z0s=wasm_f32x4_splat(v0->z),Z1s=wasm_f32x4_splat(v1->z),Z2s=wasm_f32x4_splat(v2->z);
 
-  for (int ty=miny; ty<maxy; ty+=TILE) {
-    int tyend=ty+TILE; if(tyend>maxy)tyend=maxy;
+  /* tiles aligned to the ztile grid (see sp_draw_triangle) */
+  int tyStart=(miny/TILE)*TILE, txStart=(minx/TILE)*TILE;
+  for (int tyB=tyStart; tyB<maxy; tyB+=TILE) {
+    int ty = tyB<miny?miny:tyB;
+    int tyend=tyB+TILE; if(tyend>maxy)tyend=maxy;
+    if(ty>=tyend) continue;
     float ylo=(float)ty+0.5f, yhi=(float)(tyend-1)+0.5f;
-    for (int tx=minx; tx<maxx; tx+=TILE) {
-      int txend=tx+TILE; if(txend>maxx)txend=maxx;
+    for (int txB=txStart; txB<maxx; txB+=TILE) {
+      int tx = txB<minx?minx:txB;
+      int txend=txB+TILE; if(txend>maxx)txend=maxx;
+      if(tx>=txend) continue;
       float xlo=(float)tx+0.5f, xhi=(float)(txend-1)+0.5f;
       float mx0=A0*(x0pos0?xhi:xlo)+B0*(y0pos0?yhi:ylo)+C0; if(mx0<0.0f)continue;
       float mx1=A1*(x0pos1?xhi:xlo)+B1*(y0pos1?yhi:ylo)+C1; if(mx1<0.0f)continue;
@@ -624,9 +673,10 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
       float mn1=A1*(x0pos1?xlo:xhi)+B1*(y0pos1?ylo:yhi)+C1;
       float mn2=A2*(x0pos2?xlo:xhi)+B2*(y0pos2?ylo:yhi)+C2;
       int tile_full=(mn0>=0.0f&&mn1>=0.0f&&mn2>=0.0f);
-      int tileIdx=(ty/TILE)*tilesW+(tx/TILE);
+      int tileIdx=(tyB/TILE)*tilesW+(txB/TILE);
       float zmnT=Az*(zxpos?xlo:xhi)+Bz*(zypos?ylo:yhi)+Cz;
       if(do_ztile && zmnT>ztileBuf[tileIdx]) continue;
+      int tileWrote=0; v128_t tileZmaxAcc=wasm_f32x4_splat(-1.0e30f);
       float fminx=(float)tx+0.5f;
       v128_t txmax4=wasm_f32x4_splat((float)txend);
 
@@ -671,15 +721,25 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
           #define GB_STORE(PLANE,VAL) wasm_v128_store(PLANE+base, wasm_v128_bitselect(VAL, wasm_v128_load(PLANE+base), pass))
           GB_STORE(gu,U); GB_STORE(gv,V); GB_STORE(gr,R); GB_STORE(gg,G); GB_STORE(gb,B); GB_STORE(ga,A);
           #undef GB_STORE
-          if (do_depth) wasm_v128_store(depthBuf+base, wasm_v128_bitselect(z, wasm_v128_load(depthBuf+base), pass));
+          if (do_depth) {
+            wasm_v128_store(depthBuf+base, wasm_v128_bitselect(z, wasm_v128_load(depthBuf+base), pass));
+            tileZmaxAcc = wasm_f32x4_max(tileZmaxAcc, wasm_v128_bitselect(z, wasm_f32x4_splat(-1.0e30f), pass));
+          }
           /* cover byte per passing lane */
           uint32_t pm=(uint32_t)wasm_i32x4_bitmask(pass);
           int rem = txend - x; if (rem > 4) rem = 4;
-          for (int l=0;l<rem;l++) if (pm&(1u<<l)) gc[base+l]=1;
+          int wl=0;
+          for (int l=0;l<rem;l++) if (pm&(1u<<l)) { gc[base+l]=1; wl++; }
+          tileWrote += wl;
         }
       }
-      if (do_ztile && tile_full && do_depth) {
-        float zmxT=Az*(zxpos?xhi:xlo)+Bz*(zypos?yhi:ylo)+Cz;
+      /* safe Zmax update: full UNCLIPPED cell, every pixel written (see sp_draw_triangle) */
+      if (do_ztile && do_depth
+          && tx==txB && (txend-txB)==TILE && ty==tyB && (tyend-tyB)==TILE
+          && tileWrote==TILE*TILE) {
+        float m0=wasm_f32x4_extract_lane(tileZmaxAcc,0),m1=wasm_f32x4_extract_lane(tileZmaxAcc,1);
+        float m2=wasm_f32x4_extract_lane(tileZmaxAcc,2),m3=wasm_f32x4_extract_lane(tileZmaxAcc,3);
+        float zmxT=m0>m1?m0:m1; float t2=m2>m3?m2:m3; zmxT=zmxT>t2?zmxT:t2;
         if(zmxT<ztileBuf[tileIdx]) ztileBuf[tileIdx]=zmxT;
       }
     }
