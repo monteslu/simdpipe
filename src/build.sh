@@ -21,8 +21,16 @@ emcc simdpipe.c \
 
 echo ">> threaded build"
 # Threaded: fixed memory (no growth with threads is simpler/faster), shared.
+# NOTE: -DSP_NO_ZTILE disables the coarse per-tile Zmax depth-rejection grid in
+# the threaded build. ztile is a single shared g_ctx buffer; with band-parallel
+# workers a triangle spanning bands has its tile slices updated by different
+# threads, and the cross-thread read/update ordering diverges from the serial
+# reference (pooled-vs-serial was bit-identical before ztile, breaks with it).
+# The optimization is single-thread-only for now; making it thread-safe (per-band
+# private ztile rows, no cross-band reads) is tracked as a follow-up. The pooled
+# path's whole point is multicore throughput, where coarse-depth matters less.
 emcc simdpipe.c \
-  -O3 -msimd128 -ffast-math -pthread -DSP_THREADS=1 \
+  -O3 -msimd128 -ffast-math -pthread -DSP_THREADS=1 -DSP_NO_ZTILE \
   -s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 \
   -s ENVIRONMENT=node,web,worker \
   -s INITIAL_MEMORY=268435456 -s MAXIMUM_MEMORY=268435456 \

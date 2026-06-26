@@ -311,7 +311,11 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
    * On top of geometric reject/accept, a coarse Zmax test skips tiles where the
    * triangle is fully occluded (its min depth in the tile > the tile's Zmax). */
   const int TILE = SP_RASTER_TILE;
+#ifdef SP_NO_ZTILE
+  int do_ztile = 0;
+#else
   int do_ztile = do_depth && ctx->ztile != NULL;
+#endif
   float * ztileBuf = ctx->ztile;
   int tilesW = ctx->tiles_w;
   /* z is an affine plane in screen space. Since the normalized edges satisfy
