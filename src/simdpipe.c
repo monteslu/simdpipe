@@ -47,7 +47,7 @@ enum {
 /* Rasterizer tile size (pixels). Used for hierarchical reject/accept AND the
  * coarse per-tile Zmax depth-rejection grid, so it's a file-level constant. */
 #ifndef SP_RASTER_TILE
-#define SP_RASTER_TILE 16   /* swept: 16 beats 4/8/32 on fill+balanced */
+#define SP_RASTER_TILE 8    /* swept: 8 wins balanced+shade+small; 16 better only for pure big-tri fill */
 #endif
 
 /* ---- renderer state ---- */
