@@ -387,6 +387,107 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
   }
 }
 
+/* ---------- programmable path: varying G-buffer ----------
+ * Instead of writing final color, rasterize interpolated varyings into SoA
+ * planes (u, v, r, g, b, a) + a coverage mask, performing the depth test/write.
+ * A programmable fragment shader (JS callback in Tier-2, or a JIT'd WASM module
+ * in Tier-1) then consumes these planes and writes color. This is what makes
+ * simdpipe a real (programmable) renderer rather than fixed-function.
+ *
+ * G-buffer planes are full-framebuffer SoA (w*h each). `cover` is 0/1 per pixel
+ * for "this pixel was written by some triangle this pass and passed depth". */
+static float *g_gb_u, *g_gb_v, *g_gb_r, *g_gb_g, *g_gb_b, *g_gb_a;
+static uint8_t *g_gb_cover;
+
+EXPORT int sp_gbuffer_init(void) {
+  size_t n = (size_t)g_ctx.w * g_ctx.h + 4;
+  g_gb_u = malloc(n * 4); g_gb_v = malloc(n * 4);
+  g_gb_r = malloc(n * 4); g_gb_g = malloc(n * 4);
+  g_gb_b = malloc(n * 4); g_gb_a = malloc(n * 4);
+  g_gb_cover = malloc(n);
+  return g_gb_u && g_gb_v && g_gb_r && g_gb_g && g_gb_b && g_gb_a && g_gb_cover;
+}
+EXPORT float *sp_gb_u(void){return g_gb_u;} EXPORT float *sp_gb_v(void){return g_gb_v;}
+EXPORT float *sp_gb_r(void){return g_gb_r;} EXPORT float *sp_gb_g(void){return g_gb_g;}
+EXPORT float *sp_gb_b(void){return g_gb_b;} EXPORT float *sp_gb_a(void){return g_gb_a;}
+EXPORT uint8_t *sp_gb_cover(void){return g_gb_cover;}
+
+EXPORT void sp_gbuffer_clear(void) {
+  memset(g_gb_cover, 0, (size_t)g_ctx.w * g_ctx.h);
+}
+
+/* Rasterize one triangle into the varying G-buffer (depth-tested). */
+static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_vert *v2) {
+  sp_ctx *ctx = &g_ctx;
+  int W = ctx->w, H = ctx->h;
+  float area2 = (v1->x - v0->x) * (v2->y - v0->y) - (v1->y - v0->y) * (v2->x - v0->x);
+  if (area2 == 0.0f) return;
+  float inv_area2 = 1.0f / area2;
+
+  float minxf = sp_min3f(v0->x, v1->x, v2->x), maxxf = sp_max3f(v0->x, v1->x, v2->x);
+  float minyf = sp_min3f(v0->y, v1->y, v2->y), maxyf = sp_max3f(v0->y, v1->y, v2->y);
+  int minx = (int)floorf(minxf), maxx = (int)ceilf(maxxf);
+  int miny = (int)floorf(minyf), maxy = (int)ceilf(maxyf);
+  if (minx < 0) minx = 0; if (miny < 0) miny = 0;
+  if (maxx > W) maxx = W; if (maxy > H) maxy = H;
+  if (minx >= maxx || miny >= maxy) return;
+
+  float A0 = (v1->y - v2->y) * inv_area2, B0 = (v2->x - v1->x) * inv_area2;
+  float A1 = (v2->y - v0->y) * inv_area2, B1 = (v0->x - v2->x) * inv_area2;
+  float A2 = (v0->y - v1->y) * inv_area2, B2 = (v1->x - v0->x) * inv_area2;
+  float C0 = -(A0 * v1->x + B0 * v1->y);
+  float C1 = -(A1 * v2->x + B1 * v2->y);
+  float C2 = -(A2 * v0->x + B2 * v0->y);
+
+  int persp = (ctx->flags & SP_FLAG_PERSP_CORRECT) != 0;
+  int do_depth = (ctx->flags & SP_FLAG_DEPTH_TEST) != 0;
+  float iw0=v0->invw, iw1=v1->invw, iw2=v2->invw;
+  float u0=v0->u,u1=v1->u,u2=v2->u, vv0=v0->v,vv1=v1->v,vv2=v2->v;
+  float r0=v0->r,r1=v1->r,r2=v2->r, g0=v0->g,g1=v1->g,g2=v2->g;
+  float b0=v0->b,b1=v1->b,b2=v2->b, a0=v0->a,a1=v1->a,a2=v2->a;
+  if (persp){u0*=iw0;u1*=iw1;u2*=iw2;vv0*=iw0;vv1*=iw1;vv2*=iw2;
+             r0*=iw0;r1*=iw1;r2*=iw2;g0*=iw0;g1*=iw1;g2*=iw2;
+             b0*=iw0;b1*=iw1;b2*=iw2;a0*=iw0;a1*=iw1;a2*=iw2;}
+
+  float *gu=g_gb_u,*gv=g_gb_v,*gr=g_gb_r,*gg=g_gb_g,*gb=g_gb_b,*ga=g_gb_a;
+  uint8_t *gc=g_gb_cover; float *depthBuf=ctx->depth;
+
+  for (int y = miny; y < maxy; y++) {
+    float yc = (float)y + 0.5f;
+    for (int x = minx; x < maxx; x++) {
+      float xc = (float)x + 0.5f;
+      float w0 = A0*xc + B0*yc + C0;
+      float w1 = A1*xc + B1*yc + C1;
+      float w2 = A2*xc + B2*yc + C2;
+      if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+      int idx = y*W + x;
+      float z = w0*v0->z + w1*v1->z + w2*v2->z;
+      if (do_depth) { if (z >= depthBuf[idx]) continue; }
+      float recip = 1.0f;
+      if (persp) { float iw = w0*iw0 + w1*iw1 + w2*iw2; recip = 1.0f/iw; }
+      gu[idx] = (w0*u0+w1*u1+w2*u2)*recip;
+      gv[idx] = (w0*vv0+w1*vv1+w2*vv2)*recip;
+      gr[idx] = (w0*r0+w1*r1+w2*r2)*recip;
+      gg[idx] = (w0*g0+w1*g1+w2*g2)*recip;
+      gb[idx] = (w0*b0+w1*b1+w2*b2)*recip;
+      ga[idx] = (w0*a0+w1*a1+w2*a2)*recip;
+      gc[idx] = 1;
+      if (do_depth) depthBuf[idx] = z;
+    }
+  }
+}
+
+EXPORT void sp_draw_gbuffer_flat(const float *verts, int ntris) {
+  for (int t = 0; t < ntris; t++) {
+    const float *p = verts + (size_t)t * 30;
+    sp_vert a, b, c;
+    a.x=p[0];a.y=p[1];a.z=p[2];a.invw=p[3];a.r=p[4];a.g=p[5];a.b=p[6];a.a=p[7];a.u=p[8];a.v=p[9];
+    b.x=p[10];b.y=p[11];b.z=p[12];b.invw=p[13];b.r=p[14];b.g=p[15];b.b=p[16];b.a=p[17];b.u=p[18];b.v=p[19];
+    c.x=p[20];c.y=p[21];c.z=p[22];c.invw=p[23];c.r=p[24];c.g=p[25];c.b=p[26];c.a=p[27];c.u=p[28];c.v=p[29];
+    sp_raster_gbuffer(&a, &b, &c);
+  }
+}
+
 /* Batch entry point: draw N triangles from a flat float buffer.
  * Layout per vertex (10 floats): x y z invw r g b a u v
  * Per triangle: 3 vertices = 30 floats. `verts` points at 3*N*10 floats. */
