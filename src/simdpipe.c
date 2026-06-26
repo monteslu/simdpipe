@@ -47,7 +47,11 @@ enum {
 /* Rasterizer tile size (pixels). Used for hierarchical reject/accept AND the
  * coarse per-tile Zmax depth-rejection grid, so it's a file-level constant. */
 #ifndef SP_RASTER_TILE
-#define SP_RASTER_TILE 16   /* swept w/ correct coarse-depth: 16 best overall */
+#define SP_RASTER_TILE 8    /* re-swept w/ correct flags + tight tiles: 8 wins 3/4
+                             * (fill/small/dense-balanced all beat llvmpipe-1T; the
+                             * finer tile rejects empty space far better on dense
+                             * scenes — bal16k 37.7→27.8ms — and only gives up ~0.5ms
+                             * on fill, which still wins). 16 left selectable. */
 #endif
 
 /* ---- renderer state ---- */
@@ -333,11 +337,20 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
    * pool's small-frame fallback) gets the win, banded workers skip it. */
   int do_ztile = do_depth && ctx->ztile != NULL
                  && tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h;
-  /* Small triangles (bbox within one tile) don't benefit from the coarse grid and
-   * would only pay its alignment + per-cell overhead. Skip ztile for them: not
-   * updating/rejecting is always conservative-safe, and it lets the tile loop use
-   * tight bbox-origin tiles (no grid snap) — a big win on tiny-triangle scenes. */
-  if ((maxx - minx) <= SP_RASTER_TILE && (maxy - miny) <= SP_RASTER_TILE) do_ztile = 0;
+  /* Coarse depth only pays off when a triangle covers enough tiles to actually
+   * occlude later overdraw — its per-cell Zmax bookkeeping + reject test is pure
+   * overhead on small triangles (which dominate "balanced"-style scenes). Measured:
+   * on small/mid triangles ztile is a net LOSS; on big overdrawing triangles (fill)
+   * it's a 1.6x win. So engage it only once the bbox spans >= SP_ZTILE_MIN_TILES
+   * grid cells. Skipping is always conservative-safe (never rejects/updates). */
+#ifndef SP_ZTILE_MIN_TILES
+#define SP_ZTILE_MIN_TILES 6
+#endif
+  {
+    int tcw = ((maxx - 1) / SP_RASTER_TILE) - (minx / SP_RASTER_TILE) + 1;
+    int tch = ((maxy - 1) / SP_RASTER_TILE) - (miny / SP_RASTER_TILE) + 1;
+    if (tcw * tch < SP_ZTILE_MIN_TILES) do_ztile = 0;
+  }
 #ifdef SP_FORCE_NO_ZTILE
   do_ztile = 0;
 #endif
@@ -356,13 +369,27 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
   const int x0pos0 = (A0 >= 0.0f), x0pos1 = (A1 >= 0.0f), x0pos2 = (A2 >= 0.0f);
   const int y0pos0 = (B0 >= 0.0f), y0pos1 = (B1 >= 0.0f), y0pos2 = (B2 >= 0.0f);
 
-  /* Tiles are ALWAYS snapped to the grid (start at floor(min/TILE)*TILE) and the
-   * processed range clamped to the bbox. This keeps the per-pixel edge stepping
-   * origin identical whether or not ztile is active, so coarse-depth is provably
-   * output-invariant (ztile-on == ztile-off, byte for byte). Grid snap is also
-   * required for ztile-cell correctness when it IS active. */
-  int tyStart = (miny / TILE) * TILE;
-  int txStart = (minx / TILE) * TILE;
+  /* Tile-origin policy:
+   *  - ztile ACTIVE → snap to grid so one traversal tile == one ztile cell.
+   *  - banded (a worker owns a y-slice, not the whole height) → snap to grid so the
+   *    tile origin is INDEPENDENT of the band clip; otherwise two workers splitting a
+   *    straddling triangle land its pixels in different 4-groups and edge-tie rounding
+   *    diverges at band seams (pooled-vs-serial then differs by a pixel).
+   *  - else (serial, full-height, ztile off — the common small-triangle case) → start
+   *    tight at the bbox; grid snap there only wastes work on empty leading columns.
+   * Tight is output-identical to grid for a full-height pass: w_i = A_i*(x+0.5)+
+   * B_i*(y+0.5)+C_i is recomputed from the ABSOLUTE row origin each scanline (never
+   * accumulated across tile seams), so a pixel's edge value is the same regardless of
+   * where its 16px tile begins. */
+  int owns_full = (tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h);
+  int tyStart, txStart;
+#ifdef SP_FORCE_GRID_TILES
+  if (1)
+#else
+  if (do_ztile || !owns_full)
+#endif
+                { tyStart = (miny / TILE) * TILE; txStart = (minx / TILE) * TILE; }
+  else          { tyStart = miny;                 txStart = minx; }
   for (int tyB = tyStart; tyB < maxy; tyB += TILE) {
     int ty = tyB < miny ? miny : tyB;            /* clamp processed range to bbox */
     int tyend = tyB + TILE; if (tyend > maxy) tyend = maxy;
@@ -637,7 +664,11 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
    * pool workers share one ztile and would race — see sp_draw_triangle. */
   int do_ztile = do_depth && ctx->ztile != NULL
                  && tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h;
-  if ((maxx - minx) <= SP_RASTER_TILE && (maxy - miny) <= SP_RASTER_TILE) do_ztile = 0;
+  {  /* engage only for big triangles — see sp_draw_triangle */
+    int tcw = ((maxx - 1) / SP_RASTER_TILE) - (minx / SP_RASTER_TILE) + 1;
+    int tch = ((maxy - 1) / SP_RASTER_TILE) - (miny / SP_RASTER_TILE) + 1;
+    if (tcw * tch < SP_ZTILE_MIN_TILES) do_ztile = 0;
+  }
 #ifdef SP_FORCE_NO_ZTILE
   do_ztile = 0;
 #endif
@@ -658,9 +689,13 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
   v128_t A2l=wasm_f32x4_mul(wasm_f32x4_splat(A2),lane_off);
   v128_t Z0s=wasm_f32x4_splat(v0->z),Z1s=wasm_f32x4_splat(v1->z),Z2s=wasm_f32x4_splat(v2->z);
 
-  /* always grid-snapped (see sp_draw_triangle) — output-invariant + ztile-safe */
-  int tyStart = (miny/TILE)*TILE;
-  int txStart = (minx/TILE)*TILE;
+  /* grid-snap when ztile active OR this call doesn't own the full height (banded
+   * worker); tight bbox start only for a full-height serial pass (see
+   * sp_draw_triangle — output-invariant, pool-safe). */
+  int owns_full = (tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h);
+  int tyStart, txStart;
+  if (do_ztile || !owns_full) { tyStart = (miny/TILE)*TILE; txStart = (minx/TILE)*TILE; }
+  else                        { tyStart = miny;             txStart = minx; }
   for (int tyB=tyStart; tyB<maxy; tyB+=TILE) {
     int ty = tyB<miny?miny:tyB;
     int tyend=tyB+TILE; if(tyend>maxy)tyend=maxy;
