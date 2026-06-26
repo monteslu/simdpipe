@@ -44,6 +44,12 @@ enum {
   SP_FLAG_TEXTURE      = 1 << 4,  /* sample bound texture, else vertex color */
 };
 
+/* Rasterizer tile size (pixels). Used for hierarchical reject/accept AND the
+ * coarse per-tile Zmax depth-rejection grid, so it's a file-level constant. */
+#ifndef SP_RASTER_TILE
+#define SP_RASTER_TILE 16   /* swept: 16 beats 4/8/32 on fill+balanced */
+#endif
+
 /* ---- renderer state ---- */
 typedef struct {
   int      w, h;
@@ -55,6 +61,14 @@ typedef struct {
   const uint32_t *tex;
   int      tex_w, tex_h;
   float    tex_wf, tex_hf;
+
+  /* coarse depth pyramid: per-tile MAX depth (conservative). A triangle whose
+   * minimum depth over a tile exceeds the tile's Zmax is fully occluded there
+   * and the whole tile is skipped — one compare instead of 256 per-pixel tests.
+   * Only ever raised toward 1.0 on clear and lowered when a tile is fully
+   * covered by closer geometry, so rejection is always safe. */
+  float   *ztile;
+  int      tiles_w, tiles_h;
 
   /* stats */
   uint64_t frag_tested;
@@ -92,6 +106,11 @@ EXPORT int sp_init(int w, int h) {
   g_ctx.color = (uint32_t *)malloc(npx * 4);
   g_ctx.depth = (float *)malloc(npx * sizeof(float));
   if (!g_ctx.color || !g_ctx.depth) return 0;
+  /* coarse Zmax tile grid */
+  g_ctx.tiles_w = (w + SP_RASTER_TILE - 1) / SP_RASTER_TILE;
+  g_ctx.tiles_h = (h + SP_RASTER_TILE - 1) / SP_RASTER_TILE;
+  g_ctx.ztile = (float *)malloc((size_t)g_ctx.tiles_w * g_ctx.tiles_h * sizeof(float));
+  if (!g_ctx.ztile) return 0;
   g_ctx.flags = SP_FLAG_DEPTH_TEST | SP_FLAG_TEXTURE | SP_FLAG_BILINEAR | SP_FLAG_PERSP_CORRECT;
   return 1;
 }
@@ -127,6 +146,11 @@ EXPORT void sp_clear(uint32_t rgba, float depth) {
     if (g_ctx.flags & SP_FLAG_DEPTH_TEST) wasm_v128_store(d + i, dv);
   }
   for (; i < n; i++) { c[i] = rgba; if (g_ctx.flags & SP_FLAG_DEPTH_TEST) d[i] = depth; }
+  /* reset the coarse Zmax grid to the clear depth (the tile's farthest possible) */
+  if (g_ctx.ztile) {
+    int nt = g_ctx.tiles_w * g_ctx.tiles_h;
+    for (int t = 0; t < nt; t++) g_ctx.ztile[t] = depth;
+  }
 }
 
 /* ---- helpers ---- */
@@ -282,11 +306,22 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
    *     the whole tile is outside the triangle → skip it, zero per-pixel tests.
    *   - accept: if every edge is >= 0 at the tile corner where it is SMALLEST,
    *     the whole tile is inside → skip the per-pixel inside test entirely.
-   * Corner selection per edge is fixed by the signs of A_i, B_i. */
-  #ifndef SP_RASTER_TILE
-  #define SP_RASTER_TILE 16   /* swept: 16 beats 4/8/32 on fill+balanced */
-  #endif
+   * Corner selection per edge is fixed by the signs of A_i, B_i.
+   *
+   * On top of geometric reject/accept, a coarse Zmax test skips tiles where the
+   * triangle is fully occluded (its min depth in the tile > the tile's Zmax). */
   const int TILE = SP_RASTER_TILE;
+  int do_ztile = do_depth && ctx->ztile != NULL;
+  float * ztileBuf = ctx->ztile;
+  int tilesW = ctx->tiles_w;
+  /* z is an affine plane in screen space. Since the normalized edges satisfy
+   * w_i = A_i*x + B_i*y + C_i and z = vz0*w0+vz1*w1+vz2*w2, the z-plane is
+   * z(x,y) = Az*x + Bz*y + Cz with: */
+  float vz0 = v0->z, vz1 = v1->z, vz2 = v2->z;
+  float Az = vz0 * A0 + vz1 * A1 + vz2 * A2;
+  float Bz = vz0 * B0 + vz1 * B1 + vz2 * B2;
+  float Cz = vz0 * C0 + vz1 * C1 + vz2 * C2;
+  const int zxpos = (Az >= 0.0f), zypos = (Bz >= 0.0f); /* corner pick for z min/max */
   /* For edge i, the "min corner" (E smallest) uses xlo if A_i>=0 else xhi, and
    * ylo if B_i>=0 else yhi; the "max corner" is the opposite. Precompute which. */
   const int x0pos0 = (A0 >= 0.0f), x0pos1 = (A1 >= 0.0f), x0pos2 = (A2 >= 0.0f);
@@ -312,6 +347,13 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
       float mn1 = A1 * (x0pos1 ? xlo : xhi) + B1 * (y0pos1 ? ylo : yhi) + C1;
       float mn2 = A2 * (x0pos2 ? xlo : xhi) + B2 * (y0pos2 ? ylo : yhi) + C2;
       int tile_full = (mn0 >= 0.0f && mn1 >= 0.0f && mn2 >= 0.0f);
+
+      /* coarse depth reject: tightest triangle z over this tile is at the z-min
+       * corner. If even that is farther than everything already in the tile, the
+       * whole triangle is occluded here — skip without touching a single pixel. */
+      int tileIdx = (ty / TILE) * tilesW + (tx / TILE);
+      float zminTile = Az * (zxpos ? xlo : xhi) + Bz * (zypos ? ylo : yhi) + Cz;
+      if (do_ztile && zminTile > ztileBuf[tileIdx]) continue;
 
       float fminx = (float)tx + 0.5f;
       v128_t txmax4 = wasm_f32x4_splat((float)txend);
@@ -461,6 +503,15 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
       ctx->frag_shaded += (uint64_t)(__builtin_popcount(wasm_i32x4_bitmask(passmask)));
     }
   }
+      /* coarse Zmax update: after a fully-covering opaque triangle, nothing in
+       * the tile is farther than the triangle's farthest covered point (kept
+       * existing pixels only ever passed the depth test by being closer). So we
+       * may safely lower the tile Zmax to the triangle's z-max over the tile.
+       * Blend keeps dst visible, so skip the update when blending. */
+      if (do_ztile && tile_full && !do_blend) {
+        float zmaxTile = Az * (zxpos ? xhi : xlo) + Bz * (zypos ? yhi : ylo) + Cz;
+        if (zmaxTile < ztileBuf[tileIdx]) ztileBuf[tileIdx] = zmaxTile;
+      }
     } /* tile x */
   }   /* tile y */
 }
