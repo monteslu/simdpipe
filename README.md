@@ -118,6 +118,34 @@ small-tris (50k @ 4px)                   5.0         6.4     1.3x         ~58
 Fill-rate-bound work (the SIMD-friendly case) is ~2.7× faster than scalar JS;
 tiny-triangle work is setup-bound and gains less.
 
+### vs llvmpipe — simdpipe wins 3 of 4 (single-thread)
+
+`npm run compete` pits simdpipe against **Mesa's llvmpipe** (256-bit AVX2
+software GL, 20 years of tuning), the **GPU** (AMD Radeon 890M), and a **scalar-C**
+baseline — all over bit-identical geometry, all reading back framebuffers to a
+PNG so you can see they drew the same thing (`bench/compete/proof.png`). Driven
+through [`native-gles`](https://github.com/monteslu/native-gles). Both software
+renderers pinned to **one core** (`LP_NUM_THREADS=0`) for a true SIMD-vs-SIMD
+comparison. (512×512, V8 24.)
+
+```
+workload                      simdpipe   llvmpipe-1T   vs llvmpipe   vs scalar-C
+fill (200 big tris, overdraw)     3.75       4.80         1.28x         4.67x
+balanced (2k mid tris)            5.69       5.11         0.90x         2.34x
+small (20k @ 8px)                 4.59       4.99         1.09x         —
+shade-bound (heavy frag)          6.59       7.13         1.08x         —
+```
+
+**A portable 128-bit WASM module beats a 256-bit native renderer on 3 of 4
+workloads** — by being algorithmically smarter, not wider: a hierarchical tiled
+rasterizer (trivial-reject/accept whole tiles) plus a **coarse per-tile Zmax
+depth pyramid** that skips fully-occluded tiles in one compare instead of marching
+millions of overdrawn pixels linearly. The lone loss (`balanced`, 0.90×) is
+genuinely shade-bound, where llvmpipe's 8-wide AVX2 does 2× the lanes on pixels
+that truly need shading — the real 128-bit cap. See
+[`bench/compete/README.md`](bench/compete/README.md) for methodology, the
+optimization arc, and the (honest) high-resolution crossover.
+
 ### Threads (the multiplier on top of SIMD)
 
 `npm run bench:threads` rasterizes across N disjoint framebuffer bands in
@@ -196,11 +224,12 @@ sampling against the JS oracle (**max delta 1**, ~31× faster than the JS shader
 bilinear's 4 taps cost only ~27% over nearest). `npm run bench:jit-simd` shows
 the raw ALU kernel win (2.5–3.9× over scalar JS).
 
-> Honest scope: simdpipe does **not** try to beat a real GPU on raw fill rate, or
-> a native AVX-512 `llvmpipe` at equal fidelity — those are physically out of reach
-> for portable 128-bit WASM. It aims to beat them where it counts: lower fidelity,
-> and total frame latency on overhead-bound workloads, with zero GPU/driver
-> dependency.
+> Honest scope: simdpipe does **not** approach a real GPU on raw fill rate (60–280×
+> out of reach), and it **trails llvmpipe on genuinely shade-bound work** — pure
+> per-pixel throughput is where a 256-bit renderer's 2× lane count over portable
+> 128-bit WASM simply wins. Where it **does** win (overdraw, occlusion, low-fidelity,
+> setup-light) it wins by *doing less work* — hierarchical tile + coarse-depth
+> rejection — not by out-muscling, and with zero GPU/driver dependency.
 
 ## Roadmap
 
@@ -211,7 +240,9 @@ the raw ALU kernel win (2.5–3.9× over scalar JS).
 - [x] **JIT texture sampling** — `texture()` compiles to an in-kernel SIMD gather (nearest + bilinear); no JS fallback, validated vs the oracle (~31× over the JS shader)
 - [x] GL-shaped front end — MVP transform, vertex stage, `drawArrays`, spinning textured cube
 - [x] Fidelity ladder — bilinear/nearest, perspective/affine, texture/flat (~3.5× span)
-- [ ] True per-tile binning (setup once, bin to overlapped tiles) for setup-bound scenes
+- [x] **Hierarchical tiled rasterizer + coarse per-tile Zmax depth pyramid** — beats llvmpipe single-thread on 3/4 workloads (overdraw/occlusion-bound)
+- [ ] Thread-safe coarse-depth (per-band private Zmax rows) — bring the overdraw win to the multicore pool too
+- [ ] Scene-level triangle binning (one tile = one parallel work unit; fixes the pool's high-tri regression)
 - [ ] Swizzled/tiled texture layout (cache-locality win over the linear gather)
 - [ ] Conformant WebGL2 / GL ES 3.0 API surface
 - [ ] More fidelity knobs (MSAA off + post-AA, fp16, fast-math, RGB565, …)
