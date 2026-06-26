@@ -118,7 +118,7 @@ small-tris (50k @ 4px)                   5.0         6.4     1.3x         ~58
 Fill-rate-bound work (the SIMD-friendly case) is ~2.7× faster than scalar JS;
 tiny-triangle work is setup-bound and gains less.
 
-### vs llvmpipe — simdpipe wins 3 of 4 (single-thread)
+### vs llvmpipe — wins on overdraw, single-thread
 
 `npm run compete` pits simdpipe against **Mesa's llvmpipe** (256-bit AVX2
 software GL, 20 years of tuning), the **GPU** (AMD Radeon 890M), and a **scalar-C**
@@ -130,21 +130,22 @@ comparison. (512×512, V8 24.)
 
 ```
 workload                      simdpipe   llvmpipe-1T   vs llvmpipe   vs scalar-C
-fill (200 big tris, overdraw)     3.75       4.80         1.28x         4.67x
-balanced (2k mid tris)            5.69       5.11         0.90x         2.34x
-small (20k @ 8px)                 4.59       4.99         1.09x         —
-shade-bound (heavy frag)          6.59       7.13         1.08x         —
+fill (200 big tris, overdraw)     4.18       4.82         1.15x         4.15x
+balanced (2k mid tris)            7.85       5.11         0.65x         1.68x
+small (20k @ 8px)                 5.50       4.82         0.88x         —
+shade-bound (heavy frag)          8.87       7.14         0.80x         —
 ```
 
-**A portable 128-bit WASM module beats a 256-bit native renderer on 3 of 4
-workloads** — by being algorithmically smarter, not wider: a hierarchical tiled
+**simdpipe beats a 256-bit native renderer on the overdraw-bound `fill` case**
+(1.15×) — by being algorithmically smarter, not wider: a hierarchical tiled
 rasterizer (trivial-reject/accept whole tiles) plus a **coarse per-tile Zmax
 depth pyramid** that skips fully-occluded tiles in one compare instead of marching
-millions of overdrawn pixels linearly. The lone loss (`balanced`, 0.90×) is
-genuinely shade-bound, where llvmpipe's 8-wide AVX2 does 2× the lanes on pixels
-that truly need shading — the real 128-bit cap. See
-[`bench/compete/README.md`](bench/compete/README.md) for methodology, the
-optimization arc, and the (honest) high-resolution crossover.
+millions of overdrawn pixels linearly. On the shade-bound cases it trails (0.65–
+0.88×): once pixels genuinely need shading, llvmpipe's 8-wide AVX2 does 2× the
+lanes per instruction and the 128-bit cap is the wall. It still **beats scalar
+native C** everywhere it's measured (1.7–4.2×). See
+[`bench/compete/README.md`](bench/compete/README.md) for methodology and the
+optimization arc.
 
 ### Threads (the multiplier on top of SIMD)
 
