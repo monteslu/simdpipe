@@ -11,6 +11,8 @@
     "lib/",
     "dist/simdpipe.mjs",
     "dist/simdpipe.wasm",
+    "dist/simdpipe-threads.mjs",
+    "dist/simdpipe-threads.wasm",
     "src/",
     "README.md",
     "LICENSE"
@@ -18,7 +20,8 @@
   "scripts": {
     "build": "bash src/build.sh",
     "smoke": "node bench/smoke.mjs",
-    "bench": "node bench/run.mjs"
+    "bench": "node bench/run.mjs",
+    "bench:threads": "node bench/threads.mjs"
   },
   "keywords": [
     "software-rasterizer",

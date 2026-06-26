@@ -157,6 +157,12 @@ static inline v128_t sp_tex_nearest4(v128_t u, v128_t v, v128_t mask) {
   return wasm_v128_load(out);
 }
 
+/* Thread-local Y-band clip. Each worker rasterizes the WHOLE triangle list but
+ * only writes rows [clip_y0, clip_y1). Bands are disjoint → no two threads ever
+ * touch the same framebuffer pixel → zero locking. Defaults cover full height. */
+static _Thread_local int tl_clip_y0 = 0;
+static _Thread_local int tl_clip_y1 = 1 << 30;
+
 /* The core triangle rasterizer. Verts are in screen space. */
 EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert *v2) {
   sp_ctx *ctx = &g_ctx;
@@ -181,6 +187,9 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
   int miny = (int)floorf(minyf); int maxy = (int)ceilf(maxyf);
   if (minx < 0) minx = 0; if (miny < 0) miny = 0;
   if (maxx > W) maxx = W; if (maxy > H) maxy = H;
+  /* clamp to this thread's band */
+  if (miny < tl_clip_y0) miny = tl_clip_y0;
+  if (maxy > tl_clip_y1) maxy = tl_clip_y1;
   if (minx >= maxx || miny >= maxy) return;
 
   /* edge setup: E_i(x,y) = A_i*x + B_i*y + C_i.
@@ -391,3 +400,49 @@ EXPORT void sp_draw_triangles_flat(const float *verts, int ntris) {
     sp_draw_triangle(&a, &b, &c);
   }
 }
+
+/* ---------- threaded rasterization (optional; pthreads build) ---------- */
+#ifdef SP_THREADS
+#include <pthread.h>
+
+typedef struct {
+  const float *verts;
+  int ntris;
+  int y0, y1;
+} sp_band_job;
+
+static void *sp_band_worker(void *arg) {
+  sp_band_job *j = (sp_band_job *)arg;
+  tl_clip_y0 = j->y0;
+  tl_clip_y1 = j->y1;
+  /* worker threads don't touch shared stat counters (would race); stats are a
+   * single-thread debugging facility. */
+  sp_draw_triangles_flat(j->verts, j->ntris);
+  return NULL;
+}
+
+/* Draw N triangles across `nthreads` horizontal framebuffer bands in parallel.
+ * Bands are disjoint pixel rows → no locking. nthreads<=1 falls back to serial.
+ * The depth buffer must already be cleared (each band reads/writes only its own
+ * rows, so a band that re-clears would race the others — clear once up front). */
+EXPORT void sp_draw_triangles_threaded(const float *verts, int ntris, int nthreads) {
+  if (nthreads <= 1) { sp_draw_triangles_flat(verts, ntris); return; }
+  if (nthreads > 32) nthreads = 32;
+  int H = g_ctx.h;
+  /* band height rounded to a multiple of 1 row; could align to tile later */
+  pthread_t th[32];
+  sp_band_job jobs[32];
+  int rows_per = (H + nthreads - 1) / nthreads;
+  int spawned = 0;
+  for (int i = 0; i < nthreads; i++) {
+    int y0 = i * rows_per;
+    int y1 = y0 + rows_per;
+    if (y0 >= H) break;
+    if (y1 > H) y1 = H;
+    jobs[i].verts = verts; jobs[i].ntris = ntris; jobs[i].y0 = y0; jobs[i].y1 = y1;
+    pthread_create(&th[i], NULL, sp_band_worker, &jobs[i]);
+    spawned++;
+  }
+  for (int i = 0; i < spawned; i++) pthread_join(th[i], NULL);
+}
+#endif
