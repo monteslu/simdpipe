@@ -274,11 +274,51 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
   uint32_t *colorBuf = ctx->color;
   float *depthBuf = ctx->depth;
 
-  float fminx = (float)minx + 0.5f;
+  /* ---- hierarchical tiled traversal ----
+   * Brute-forcing every pixel in the bbox is the real bottleneck on overdraw
+   * scenes (most pixels get inside-/depth-rejected one at a time). Instead we
+   * walk SP_RASTER_TILE-sized tiles and per tile do a trivial reject / accept:
+   *   - reject: if any edge is < 0 at the tile corner where that edge is LARGEST,
+   *     the whole tile is outside the triangle → skip it, zero per-pixel tests.
+   *   - accept: if every edge is >= 0 at the tile corner where it is SMALLEST,
+   *     the whole tile is inside → skip the per-pixel inside test entirely.
+   * Corner selection per edge is fixed by the signs of A_i, B_i. */
+  #ifndef SP_RASTER_TILE
+  #define SP_RASTER_TILE 16   /* swept: 16 beats 4/8/32 on fill+balanced */
+  #endif
+  const int TILE = SP_RASTER_TILE;
+  /* For edge i, the "min corner" (E smallest) uses xlo if A_i>=0 else xhi, and
+   * ylo if B_i>=0 else yhi; the "max corner" is the opposite. Precompute which. */
+  const int x0pos0 = (A0 >= 0.0f), x0pos1 = (A1 >= 0.0f), x0pos2 = (A2 >= 0.0f);
+  const int y0pos0 = (B0 >= 0.0f), y0pos1 = (B1 >= 0.0f), y0pos2 = (B2 >= 0.0f);
 
-  for (int y = miny; y < maxy; y++) {
+  for (int ty = miny; ty < maxy; ty += TILE) {
+    int tyend = ty + TILE; if (tyend > maxy) tyend = maxy;
+    float ylo = (float)ty + 0.5f, yhi = (float)(tyend - 1) + 0.5f;
+    for (int tx = minx; tx < maxx; tx += TILE) {
+      int txend = tx + TILE; if (txend > maxx) txend = maxx;
+      float xlo = (float)tx + 0.5f, xhi = (float)(txend - 1) + 0.5f;
+
+      /* reject: edge at its MAX corner < 0  → tile fully outside */
+      float mx0 = A0 * (x0pos0 ? xhi : xlo) + B0 * (y0pos0 ? yhi : ylo) + C0;
+      if (mx0 < 0.0f) continue;
+      float mx1 = A1 * (x0pos1 ? xhi : xlo) + B1 * (y0pos1 ? yhi : ylo) + C1;
+      if (mx1 < 0.0f) continue;
+      float mx2 = A2 * (x0pos2 ? xhi : xlo) + B2 * (y0pos2 ? yhi : ylo) + C2;
+      if (mx2 < 0.0f) continue;
+
+      /* accept: edge at its MIN corner >= 0 for all → tile fully inside */
+      float mn0 = A0 * (x0pos0 ? xlo : xhi) + B0 * (y0pos0 ? ylo : yhi) + C0;
+      float mn1 = A1 * (x0pos1 ? xlo : xhi) + B1 * (y0pos1 ? ylo : yhi) + C1;
+      float mn2 = A2 * (x0pos2 ? xlo : xhi) + B2 * (y0pos2 ? ylo : yhi) + C2;
+      int tile_full = (mn0 >= 0.0f && mn1 >= 0.0f && mn2 >= 0.0f);
+
+      float fminx = (float)tx + 0.5f;
+      v128_t txmax4 = wasm_f32x4_splat((float)txend);
+
+  for (int y = ty; y < tyend; y++) {
     float yc = (float)y + 0.5f;
-    /* edge values at the first group's 4 lanes (x = minx..minx+3) */
+    /* edge values at the first group's 4 lanes (x = tx..tx+3) */
     float row0 = A0 * fminx + B0 * yc + C0;
     float row1 = A1 * fminx + B1 * yc + C1;
     float row2 = A2 * fminx + B2 * yc + C2;
@@ -286,22 +326,27 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
     v128_t w1 = wasm_f32x4_add(wasm_f32x4_splat(row1), A1lane);
     v128_t w2 = wasm_f32x4_add(wasm_f32x4_splat(row2), A2lane);
 
-    for (int x = minx; x < maxx; x += 4,
+    for (int x = tx; x < txend; x += 4,
          w0 = wasm_f32x4_add(w0, stepX0),
          w1 = wasm_f32x4_add(w1, stepX1),
          w2 = wasm_f32x4_add(w2, stepX2)) {
-      /* w0,w1,w2 ARE the normalized barycentric weights; inside iff all >= 0.
-       * (winding sign already folded into inv_area2.) */
-      v128_t inside = wasm_v128_and(
-                        wasm_v128_and(wasm_f32x4_ge(w0, zero4),
-                                      wasm_f32x4_ge(w1, zero4)),
-                        wasm_f32x4_ge(w2, zero4));
-
-      /* mask out lanes past maxx (last group in the row) */
-      v128_t xabs = wasm_f32x4_add(wasm_f32x4_splat((float)x), lane_offset);
-      inside = wasm_v128_and(inside, wasm_f32x4_lt(xabs, maxx4));
-
-      if (!wasm_v128_any_true(inside)) continue;
+      v128_t inside;
+      if (tile_full) {
+        /* whole tile inside the triangle — only the right-edge x clamp matters */
+        v128_t xabs = wasm_f32x4_add(wasm_f32x4_splat((float)x), lane_offset);
+        inside = wasm_f32x4_lt(xabs, txmax4);
+      } else {
+        /* w0,w1,w2 ARE the normalized barycentric weights; inside iff all >= 0.
+         * (winding sign already folded into inv_area2.) */
+        inside = wasm_v128_and(
+                   wasm_v128_and(wasm_f32x4_ge(w0, zero4),
+                                 wasm_f32x4_ge(w1, zero4)),
+                   wasm_f32x4_ge(w2, zero4));
+        /* mask out lanes past the tile's right edge (last group in the row) */
+        v128_t xabs = wasm_f32x4_add(wasm_f32x4_splat((float)x), lane_offset);
+        inside = wasm_v128_and(inside, wasm_f32x4_lt(xabs, txmax4));
+        if (!wasm_v128_any_true(inside)) continue;
+      }
 
       /* interpolate depth (always linear in screen space) */
       v128_t z = wasm_f32x4_add(
@@ -416,6 +461,8 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
       ctx->frag_shaded += (uint64_t)(__builtin_popcount(wasm_i32x4_bitmask(passmask)));
     }
   }
+    } /* tile x */
+  }   /* tile y */
 }
 
 /* ---------- programmable path: varying G-buffer ----------
