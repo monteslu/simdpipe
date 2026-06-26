@@ -450,9 +450,15 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
          w2 = wasm_f32x4_add(w2, stepX2)) {
       v128_t inside;
       if (tile_full) {
-        /* whole tile inside the triangle — only the right-edge x clamp matters */
-        v128_t xabs = wasm_f32x4_add(wasm_f32x4_splat((float)x), lane_offset);
-        inside = wasm_f32x4_lt(xabs, txmax4);
+        /* whole tile inside the triangle — only the right-edge x clamp matters, and
+         * only for the last group that can straddle txend (interior groups are all
+         * in → all-ones mask, no test needed). */
+        if (x + 4 > txend) {
+          v128_t xabs = wasm_f32x4_add(wasm_f32x4_splat((float)x), lane_offset);
+          inside = wasm_f32x4_lt(xabs, txmax4);
+        } else {
+          inside = wasm_i32x4_const(-1,-1,-1,-1);  /* all lanes inside */
+        }
       } else {
         /* w0,w1,w2 ARE the normalized barycentric weights; inside iff all >= 0.
          * (winding sign already folded into inv_area2.) */
@@ -460,9 +466,16 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
                    wasm_v128_and(wasm_f32x4_ge(w0, zero4),
                                  wasm_f32x4_ge(w1, zero4)),
                    wasm_f32x4_ge(w2, zero4));
-        /* mask out lanes past the tile's right edge (last group in the row) */
-        v128_t xabs = wasm_f32x4_add(wasm_f32x4_splat((float)x), lane_offset);
-        inside = wasm_v128_and(inside, wasm_f32x4_lt(xabs, txmax4));
+        /* The right-edge clamp (mask lanes past txend) is only needed on the LAST
+         * group of a tile row — when this group's 4 lanes don't all fit before
+         * txend. Interior groups (x+4 <= txend) are fully in-tile, so skip the
+         * splat+add+lt+and there. Matters most at small TILE (8px tile = 2 groups,
+         * only the 2nd can possibly straddle) and on the partial-tile-heavy scenes
+         * (small triangles) where this inside test is the dominant cost. */
+        if (x + 4 > txend) {
+          v128_t xabs = wasm_f32x4_add(wasm_f32x4_splat((float)x), lane_offset);
+          inside = wasm_v128_and(inside, wasm_f32x4_lt(xabs, txmax4));
+        }
         if (!wasm_v128_any_true(inside)) continue;
       }
 
@@ -730,12 +743,16 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
              w0=wasm_f32x4_add(w0,sX0),w1=wasm_f32x4_add(w1,sX1),w2=wasm_f32x4_add(w2,sX2)) {
           v128_t inside;
           if (tile_full) {
-            v128_t xabs=wasm_f32x4_add(wasm_f32x4_splat((float)x),lane_off);
-            inside=wasm_f32x4_lt(xabs,txmax4);
+            if (x+4>txend) {
+              v128_t xabs=wasm_f32x4_add(wasm_f32x4_splat((float)x),lane_off);
+              inside=wasm_f32x4_lt(xabs,txmax4);
+            } else inside=wasm_i32x4_const(-1,-1,-1,-1);
           } else {
             inside=wasm_v128_and(wasm_v128_and(wasm_f32x4_ge(w0,zero4),wasm_f32x4_ge(w1,zero4)),wasm_f32x4_ge(w2,zero4));
-            v128_t xabs=wasm_f32x4_add(wasm_f32x4_splat((float)x),lane_off);
-            inside=wasm_v128_and(inside,wasm_f32x4_lt(xabs,txmax4));
+            if (x+4>txend) { /* right-edge clamp only on the last (straddling) group */
+              v128_t xabs=wasm_f32x4_add(wasm_f32x4_splat((float)x),lane_off);
+              inside=wasm_v128_and(inside,wasm_f32x4_lt(xabs,txmax4));
+            }
             if(!wasm_v128_any_true(inside)) continue;
           }
           v128_t z=wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(w0,Z0s),wasm_f32x4_mul(w1,Z1s)),wasm_f32x4_mul(w2,Z2s));
