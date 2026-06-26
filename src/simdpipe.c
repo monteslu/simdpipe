@@ -536,44 +536,136 @@ EXPORT void sp_draw_triangles_flat(const float *verts, int ntris) {
 /* ---------- threaded rasterization (optional; pthreads build) ---------- */
 #ifdef SP_THREADS
 #include <pthread.h>
+#include <stdatomic.h>
 
-typedef struct {
+/* Persistent worker pool with atomic tile-row dispatch.
+ *
+ * Created ONCE (sp_pool_start). The screen is split into TILE_ROWS-high bands;
+ * a shared atomic counter hands the next band to whichever worker is free
+ * (work-stealing → load-balanced, unlike static bands). Sync is two barriers per
+ * draw: all threads rendezvous at `bar_start` (job is published), drain the
+ * counter, then rendezvous at `bar_done`. No per-frame thread spawn.
+ *
+ * Bands are disjoint pixel rows, so workers never write the same pixel — zero
+ * locking on the framebuffer/G-buffer. */
+#define SP_TILE_ROWS 16
+#define SP_POOL_MAX 32
+
+static struct {
+  int nthreads;
+  pthread_t th[SP_POOL_MAX];
+  pthread_barrier_t bar_start, bar_done;
+  /* job */
   const float *verts;
   int ntris;
-  int y0, y1;
-} sp_band_job;
+  int nbands;
+  int gbuffer;             /* 1 = G-buffer path, 0 = fixed-function color path */
+  _Atomic int next_band;   /* atomic work counter */
+  _Atomic int shutdown;
+  int started;
+} g_pool;
 
+static void sp_run_band(int band) {
+  int y0 = band * SP_TILE_ROWS;
+  int y1 = y0 + SP_TILE_ROWS;
+  if (y1 > g_ctx.h) y1 = g_ctx.h;
+  tl_clip_y0 = y0; tl_clip_y1 = y1;
+  if (g_pool.gbuffer) sp_draw_gbuffer_flat(g_pool.verts, g_pool.ntris);
+  else                sp_draw_triangles_flat(g_pool.verts, g_pool.ntris);
+}
+
+static void sp_drain_bands(void) {
+  for (;;) {
+    int band = atomic_fetch_add(&g_pool.next_band, 1);
+    if (band >= g_pool.nbands) break;
+    sp_run_band(band);
+  }
+}
+
+static void *sp_pool_worker(void *arg) {
+  (void)arg;
+  for (;;) {
+    pthread_barrier_wait(&g_pool.bar_start);
+    if (atomic_load(&g_pool.shutdown)) return NULL;
+    sp_drain_bands();
+    pthread_barrier_wait(&g_pool.bar_done);
+  }
+}
+
+/* Start the pool with n worker threads (call once after sp_init). */
+EXPORT int sp_pool_start(int n) {
+  if (g_pool.started) return 1;
+  if (n < 1) n = 1; if (n > SP_POOL_MAX) n = SP_POOL_MAX;
+  g_pool.nthreads = n;
+  atomic_store(&g_pool.shutdown, 0);
+  /* barriers include the main thread (+1) */
+  pthread_barrier_init(&g_pool.bar_start, NULL, n + 1);
+  pthread_barrier_init(&g_pool.bar_done, NULL, n + 1);
+  for (int i = 0; i < n; i++) {
+    if (pthread_create(&g_pool.th[i], NULL, sp_pool_worker, NULL) != 0) return 0;
+  }
+  g_pool.started = 1;
+  return 1;
+}
+
+EXPORT void sp_pool_stop(void) {
+  if (!g_pool.started) return;
+  atomic_store(&g_pool.shutdown, 1);
+  pthread_barrier_wait(&g_pool.bar_start);   /* release workers to see shutdown */
+  for (int i = 0; i < g_pool.nthreads; i++) pthread_join(g_pool.th[i], NULL);
+  pthread_barrier_destroy(&g_pool.bar_start);
+  pthread_barrier_destroy(&g_pool.bar_done);
+  g_pool.started = 0;
+}
+
+/* internal: dispatch the current job across the pool + main thread */
+static void sp_pool_dispatch(const float *verts, int ntris, int gbuffer) {
+  g_pool.verts = verts; g_pool.ntris = ntris; g_pool.gbuffer = gbuffer;
+  g_pool.nbands = (g_ctx.h + SP_TILE_ROWS - 1) / SP_TILE_ROWS;
+  atomic_store(&g_pool.next_band, 0);
+  pthread_barrier_wait(&g_pool.bar_start);   /* go */
+  sp_drain_bands();                          /* main thread participates */
+  pthread_barrier_wait(&g_pool.bar_done);    /* join */
+}
+
+/* Below this triangle count, barrier/dispatch overhead exceeds the parallel win,
+ * so run serially. (WASM futex-based barrier latency makes fine-grained sync
+ * costly; only amortizes on substantial frames.) Tunable. */
+#define SP_POOL_MIN_TRIS 256
+
+/* Pooled fixed-function draw (color path). Falls back to serial if no pool or if
+ * the frame is too small to amortize thread sync. */
+EXPORT void sp_draw_triangles_pooled(const float *verts, int ntris) {
+  if (!g_pool.started || ntris < SP_POOL_MIN_TRIS) { sp_draw_triangles_flat(verts, ntris); return; }
+  sp_pool_dispatch(verts, ntris, 0);
+}
+
+/* Pooled programmable raster (G-buffer path). Caller clears the G-buffer first. */
+EXPORT void sp_draw_gbuffer_pooled(const float *verts, int ntris) {
+  if (!g_pool.started || ntris < SP_POOL_MIN_TRIS) { sp_draw_gbuffer_flat(verts, ntris); return; }
+  sp_pool_dispatch(verts, ntris, 1);
+}
+
+/* ---- legacy per-frame band spawn (kept for the scaling benchmark) ---- */
+typedef struct { const float *verts; int ntris; int y0, y1; } sp_band_job;
 static void *sp_band_worker(void *arg) {
   sp_band_job *j = (sp_band_job *)arg;
-  tl_clip_y0 = j->y0;
-  tl_clip_y1 = j->y1;
-  /* worker threads don't touch shared stat counters (would race); stats are a
-   * single-thread debugging facility. */
+  tl_clip_y0 = j->y0; tl_clip_y1 = j->y1;
   sp_draw_triangles_flat(j->verts, j->ntris);
   return NULL;
 }
-
-/* Draw N triangles across `nthreads` horizontal framebuffer bands in parallel.
- * Bands are disjoint pixel rows → no locking. nthreads<=1 falls back to serial.
- * The depth buffer must already be cleared (each band reads/writes only its own
- * rows, so a band that re-clears would race the others — clear once up front). */
 EXPORT void sp_draw_triangles_threaded(const float *verts, int ntris, int nthreads) {
   if (nthreads <= 1) { sp_draw_triangles_flat(verts, ntris); return; }
   if (nthreads > 32) nthreads = 32;
   int H = g_ctx.h;
-  /* band height rounded to a multiple of 1 row; could align to tile later */
-  pthread_t th[32];
-  sp_band_job jobs[32];
+  pthread_t th[32]; sp_band_job jobs[32];
   int rows_per = (H + nthreads - 1) / nthreads;
   int spawned = 0;
   for (int i = 0; i < nthreads; i++) {
-    int y0 = i * rows_per;
-    int y1 = y0 + rows_per;
-    if (y0 >= H) break;
-    if (y1 > H) y1 = H;
+    int y0 = i * rows_per, y1 = y0 + rows_per;
+    if (y0 >= H) break; if (y1 > H) y1 = H;
     jobs[i].verts = verts; jobs[i].ntris = ntris; jobs[i].y0 = y0; jobs[i].y1 = y1;
-    pthread_create(&th[i], NULL, sp_band_worker, &jobs[i]);
-    spawned++;
+    pthread_create(&th[i], NULL, sp_band_worker, &jobs[i]); spawned++;
   }
   for (int i = 0; i < spawned; i++) pthread_join(th[i], NULL);
 }

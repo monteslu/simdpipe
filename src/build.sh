@@ -28,7 +28,7 @@ emcc simdpipe.c \
   -s INITIAL_MEMORY=268435456 -s MAXIMUM_MEMORY=268435456 \
   -s PTHREAD_POOL_SIZE=24 \
   -s EXPORTED_RUNTIME_METHODS='["HEAPU8","HEAPU32","HEAPF32","cwrap","ccall"]' \
-  -s EXPORTED_FUNCTIONS='["_sp_init","_sp_alloc","_sp_free","_sp_color_ptr","_sp_depth_ptr","_sp_width","_sp_height","_sp_set_flags","_sp_get_flags","_sp_bind_texture","_sp_reset_stats","_sp_stat_frag_tested","_sp_stat_frag_shaded","_sp_stat_tris","_sp_clear","_sp_draw_triangle","_sp_draw_triangles_flat","_sp_draw_triangles_threaded","_sp_gbuffer_init","_sp_gbuffer_clear","_sp_draw_gbuffer_flat","_sp_gb_u","_sp_gb_v","_sp_gb_r","_sp_gb_g","_sp_gb_b","_sp_gb_a","_sp_gb_cover","_malloc","_free"]' \
+  -s EXPORTED_FUNCTIONS='["_sp_init","_sp_alloc","_sp_free","_sp_color_ptr","_sp_depth_ptr","_sp_width","_sp_height","_sp_set_flags","_sp_get_flags","_sp_bind_texture","_sp_reset_stats","_sp_stat_frag_tested","_sp_stat_frag_shaded","_sp_stat_tris","_sp_clear","_sp_draw_triangle","_sp_draw_triangles_flat","_sp_draw_triangles_threaded","_sp_pool_start","_sp_pool_stop","_sp_draw_triangles_pooled","_sp_draw_gbuffer_pooled","_sp_gbuffer_init","_sp_gbuffer_clear","_sp_draw_gbuffer_flat","_sp_gb_u","_sp_gb_v","_sp_gb_r","_sp_gb_g","_sp_gb_b","_sp_gb_a","_sp_gb_cover","_malloc","_free"]' \
   -o "$OUT/simdpipe-threads.mjs"
 
 echo "built:"
