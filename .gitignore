@@ -4,3 +4,4 @@ node_modules/
 bench/_*.mjs
 bench/*.json
 /tmp/
+bench/cube.ppm
