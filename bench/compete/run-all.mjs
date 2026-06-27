@@ -69,7 +69,7 @@ const llvm1 = runJSON([join(__dir, 'gl-harness.mjs'), '--size', SIZE, '--frames'
   { LIBGL_ALWAYS_SOFTWARE: '1', GALLIUM_DRIVER: 'llvmpipe', LP_NUM_THREADS: '0' });
 console.log('done →', llvm1.renderer);
 process.stdout.write('[3/4] native scalar C...         ');
-const nat = { fill: runC('fill', 200), balanced: runC('balanced', 2000), small: runC('small', 20000, 8) };
+const nat = { fill: runC('fill', 200), balanced: runC('balanced', 2000), dense: runC('balanced', 16000), small: runC('small', 20000, 8) };
 console.log(nat.fill ? 'done' : 'skipped (binary not built)');
 process.stdout.write('[4/4] GPU (honesty check)...     ');
 let gpu = null;
@@ -79,7 +79,7 @@ catch (e) { console.log('skipped'); }
 const byName = (a) => Object.fromEntries((a || []).map(r => [r.name, r]));
 const sp1R = byName(sp1.results), llvm1R = byName(llvm1.results), gpuR = gpu ? byName(gpu.results) : {};
 const WL = sp1.results.map(r => r.name);
-const natKind = (n) => n.startsWith('fill') ? 'fill' : n.startsWith('balanced') ? 'balanced' : n.startsWith('small') ? 'small' : null;
+const natKind = (n) => n.startsWith('fill') ? 'fill' : n.startsWith('dense') ? 'dense' : n.startsWith('balanced') ? 'balanced' : n.startsWith('small') ? 'small' : null;
 
 console.log(`\n${'─'.repeat(82)}`);
 console.log('PART 1 · SINGLE-THREAD — both software renderers on 1 core (SIMD vs SIMD)');

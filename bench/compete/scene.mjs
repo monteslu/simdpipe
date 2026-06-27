@@ -65,10 +65,14 @@ export function makeScene(kind, ntris, W, H, opts = {}) {
   return buf;
 }
 
-/** Workload table shared by all harnesses. */
+/** Workload table shared by all harnesses. The `balanced` pair brackets the
+ * crossover: at a trivially-low 2k triangles simdpipe trails (its tile + coarse-
+ * depth machinery isn't amortized), but at a realistic 16k it pulls ahead and the
+ * gap keeps widening with density — so we show both, not just the flattering one. */
 export const WORKLOADS = [
   { name: 'fill (200 big tris, overdraw)', kind: 'fill', ntris: 200 },
   { name: 'balanced (2k mid tris)', kind: 'balanced', ntris: 2000 },
+  { name: 'dense (16k mid tris)', kind: 'balanced', ntris: 16000 },
   { name: 'small (20k @ 8px)', kind: 'small', ntris: 20000, px: 8 },
 ];
 
