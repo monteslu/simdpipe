@@ -330,13 +330,19 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
    * On top of geometric reject/accept, a coarse Zmax test skips tiles where the
    * triangle is fully occluded (its min depth in the tile > the tile's Zmax). */
   const int TILE = SP_RASTER_TILE;
-  /* Coarse-depth is safe only when THIS call owns the whole framebuffer height
-   * (serial / single-thread fallback). Banded pool workers each see a y-slice and
-   * share one g_ctx.ztile; gating on full-screen ownership keeps the grid
-   * single-writer without a compile-time switch — the serial path (incl. the
-   * pool's small-frame fallback) gets the win, banded workers skip it. */
-  int do_ztile = do_depth && ctx->ztile != NULL
-                 && tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h;
+  /* Coarse-depth (ztile) is a shared row-major grid (tiles_w × tiles_h). A worker
+   * may touch ztile cells only in rows it EXCLUSIVELY owns, or two threads racing
+   * the same cell corrupt the Zmax. The grid is row-major and bands are disjoint
+   * y-slices, so a band owns ztile rows [clip_y0/TILE, clip_y1/TILE) — provided its
+   * boundaries fall ON cell boundaries (clip_y0 a multiple of TILE; clip_y1 a
+   * multiple of TILE or the screen bottom). Pool bands are SP_TILE_ROWS-high and
+   * SP_TILE_ROWS % TILE == 0, so they always align → banded workers get coarse-depth
+   * too, each confined to its own private rows, with zero locking. (The serial /
+   * single-thread / small-frame-fallback path owns the whole height and trivially
+   * satisfies this.) A band whose edges don't align (shouldn't happen) just skips. */
+  int band_aligned = (tl_clip_y0 % TILE == 0)
+                     && (tl_clip_y1 % TILE == 0 || tl_clip_y1 >= ctx->h);
+  int do_ztile = do_depth && ctx->ztile != NULL && band_aligned;
   /* Coarse depth only pays off when a triangle covers enough tiles to actually
    * occlude later overdraw — its per-cell Zmax bookkeeping + reject test is pure
    * overhead on small triangles (which dominate "balanced"-style scenes). Measured:
@@ -673,10 +679,11 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
    * sp_draw_triangle (this path was the shade-bound bottleneck: 94% of frame in
    * a scalar one-pixel loop). Writes 6 varying planes + a cover byte per lane. */
   const int TILE = SP_RASTER_TILE;
-  /* coarse-depth only when this call owns the whole height (serial path); banded
-   * pool workers share one ztile and would race — see sp_draw_triangle. */
-  int do_ztile = do_depth && ctx->ztile != NULL
-                 && tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h;
+  /* coarse-depth: safe for a banded worker as long as its band falls on ztile-cell
+   * boundaries (it then owns those rows exclusively) — see sp_draw_triangle. */
+  int band_aligned = (tl_clip_y0 % TILE == 0)
+                     && (tl_clip_y1 % TILE == 0 || tl_clip_y1 >= ctx->h);
+  int do_ztile = do_depth && ctx->ztile != NULL && band_aligned;
   {  /* engage only for big triangles — see sp_draw_triangle */
     int tcw = ((maxx - 1) / SP_RASTER_TILE) - (minx / SP_RASTER_TILE) + 1;
     int tch = ((maxy - 1) / SP_RASTER_TILE) - (miny / SP_RASTER_TILE) + 1;
