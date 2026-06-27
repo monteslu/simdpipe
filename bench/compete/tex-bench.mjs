@@ -38,6 +38,7 @@ for (let y = 0; y < TH; y++) for (let x = 0; x < TW; x++) {
 
 const WL = [
   ['fill (200 big tris)', 'fill', 200, undefined],
+  ['dense (8k big tris, overdraw)', 'fill', 8000, undefined],
   ['balanced (2k mid tris)', 'balanced', 2000, undefined],
   ['small (20k @ 8px)', 'small', 20000, 8],
 ];

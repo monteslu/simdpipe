@@ -144,12 +144,17 @@ single-thread, outputs pixel-matched):
 ```
 workload                      simdpipe   llvmpipe-1T   vs llvmpipe (both nearest)
 fill (200 big tris)               4.13       5.39         1.30x   ← win
+dense (8k big tris, overdraw)    62.2      190.7         3.06x   ← WIN (rout)
 small (20k @ 8px)                 4.13       5.79         1.40x   ← win
 balanced (2k mid tris)            6.62       6.03         0.91x
 ```
 
-…and simdpipe's fast nearest+affine tier beats llvmpipe at **bilinear** (the quality
-it'd ship) on **all three** — fill 1.54×, small 1.71×, balanced 1.15×.
+**On dense textured overdraw simdpipe is 3× faster, and the gap widens with overdraw**
+(1.3→2.4→3.0→3.3× as triangles climb 200→2k→8k→16k): coarse-depth + tile reject skip
+the *occluded texture gathers* wholesale while llvmpipe samples every fragment. Real
+3D scenes are overdraw-heavy, so this is the case that matters. simdpipe's fast tier
+also beats llvmpipe at **bilinear** on the rest — fill 1.54×, small 1.71×, balanced
+1.15×.
 
 **simdpipe beats a 256-bit native renderer on most workloads** — vertex-color `fill`
 (1.18×), `small` (1.20×), dense scenes (1.33×), and textured `fill`/`small`

@@ -130,11 +130,18 @@ geometry (simdpipe's fixed-function single-pass texture path vs llvmpipe's GLSL
 ```
                                     sp near+aff   llvmpipe nearest   vs llvmpipe
 fill (200 big tris)                      4.13           5.39            1.30x   ← win
+dense (8k big tris, overdraw)           62.2          190.7            3.06x   ← WIN
 small (20k @ 8px)                        4.13           5.79            1.40x   ← win
 balanced (2k mid tris)                   6.62           6.03            0.91x
 ```
 
-simdpipe wins the **like-for-like nearest** case on `fill` and `small`. And against
+**On dense textured overdraw simdpipe is 3× faster** — and the gap *widens* with
+overdraw (1.3× → 2.4× → 3.0× → 3.3× as the triangle count climbs 200→2k→8k→16k).
+This is the whole thesis paying off at once: coarse-depth + tile reject skip the
+*occluded texture gathers* wholesale, while llvmpipe samples every fragment. Real 3D
+scenes are full of overdraw, so this is the case that matters — and it's a rout.
+
+simdpipe also wins the **like-for-like nearest** case on `fill` and `small`. And against
 llvmpipe at **bilinear** — the quality a real app actually ships — simdpipe's fast
 nearest+affine tier wins **all three**:
 

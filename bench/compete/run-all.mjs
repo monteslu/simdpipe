@@ -141,18 +141,18 @@ const texLP = runJSON([join(__dir, 'tex-bench.mjs'), '--renderer', 'llvmpipe', '
 const txGet = (res, tier, name) => res.results.find(r => r.tier === tier && r.name === name)?.ms;
 const TWL = texSP.results.filter(r => r.tier === 'nearest+affine').map(r => r.name);
 console.log('\nframe time (ms, median); simdpipe nearest+affine vs llvmpipe nearest (like-for-like):\n');
-console.log(pad('workload', 26), padr('sp near+aff', 12), padr('lp nearest', 11), padr('vs llvmpipe', 13));
-console.log('-'.repeat(26 + 12 + 11 + 13));
+console.log(pad('workload', 32), padr('sp near+aff', 12), padr('lp nearest', 11), padr('vs llvmpipe', 13));
+console.log('-'.repeat(32 + 12 + 11 + 13));
 for (const n of TWL) {
   const s = txGet(texSP, 'nearest+affine', n), l = txGet(texLP, 'nearest', n);
-  console.log(pad(n, 26), padr(ms(s), 12), padr(ms(l), 11), padr(l && s ? (l / s).toFixed(2) + 'x' : '—', 13));
+  console.log(pad(n, 32), padr(ms(s), 12), padr(ms(l), 11), padr(l && s ? (l / s).toFixed(2) + 'x' : '—', 13));
 }
 console.log('\n…and the thesis: simdpipe\'s fast tier vs llvmpipe at BILINEAR (the quality it\'d ship):\n');
-console.log(pad('workload', 26), padr('sp near+aff', 12), padr('lp bilinear', 12), padr('sp advantage', 13));
-console.log('-'.repeat(26 + 12 + 12 + 13));
+console.log(pad('workload', 32), padr('sp near+aff', 12), padr('lp bilinear', 12), padr('sp advantage', 13));
+console.log('-'.repeat(32 + 12 + 12 + 13));
 for (const n of TWL) {
   const s = txGet(texSP, 'nearest+affine', n), lb = txGet(texLP, 'bilinear', n);
-  console.log(pad(n, 26), padr(ms(s), 12), padr(ms(lb), 12), padr(lb && s ? (lb / s).toFixed(2) + 'x' : '—', 13));
+  console.log(pad(n, 32), padr(ms(s), 12), padr(ms(lb), 12), padr(lb && s ? (lb / s).toFixed(2) + 'x' : '—', 13));
 }
 console.log('\n(both renderers sample the same checker texture; their framebuffers match to');
 console.log(' within a couple of LSBs — verified by the dumped PNGs. simdpipe wins the');
