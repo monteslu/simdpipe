@@ -270,6 +270,12 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
    * interpolate attr directly. */
   int persp = (ctx->flags & SP_FLAG_PERSP_CORRECT) != 0;
   float iw0 = v0->invw, iw1 = v1->invw, iw2 = v2->invw;
+  /* Affine fast path: when all three 1/w are equal, the interpolated 1/w is that
+   * same constant everywhere, so the per-pixel perspective divide is attr*iw / iw =
+   * attr — algebraically identical to affine. Detecting it per triangle drops the
+   * per-group reciprocal (a wasm_f32x4_div) on ALL affine geometry (2D/UI/sprites,
+   * and any scene the caller left perspective on for safely). Exact, not approximate. */
+  if (persp && iw0 == iw1 && iw1 == iw2) persp = 0;
 
   /* attribute sources (either raw or *invw) */
   float r0=v0->r,r1=v1->r,r2=v2->r, g0=v0->g,g1=v1->g,g2=v2->g;
@@ -665,6 +671,7 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
   int persp = (ctx->flags & SP_FLAG_PERSP_CORRECT) != 0;
   int do_depth = (ctx->flags & SP_FLAG_DEPTH_TEST) != 0;
   float iw0=v0->invw, iw1=v1->invw, iw2=v2->invw;
+  if (persp && iw0 == iw1 && iw1 == iw2) persp = 0;  /* affine fast path — see sp_draw_triangle */
   float u0=v0->u,u1=v1->u,u2=v2->u, vv0=v0->v,vv1=v1->v,vv2=v2->v;
   float r0=v0->r,r1=v1->r,r2=v2->r, g0=v0->g,g1=v1->g,g2=v2->g;
   float b0=v0->b,b1=v1->b,b2=v2->b, a0=v0->a,a1=v1->a,a2=v2->a;
