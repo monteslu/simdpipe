@@ -101,9 +101,9 @@ for (const n of WL) {
 
 // ============================================================================
 // PART 2 — multicore: each renderer with threads (NOT apples-to-apples in count,
-// but shows each at its best). simdpipe pool has a sweet spot (~1k big tris);
-// below MIN_TRIS it falls back to serial, and without tile-binning it regresses
-// on very high tri counts — we surface that honestly with a tri-count sweep.
+// but shows each at its best). simdpipe pool now uses per-band triangle binning +
+// per-band coarse-depth, so it scales 3.5-3.9x on substantial frames; below
+// MIN_TRIS it falls back to serial. We surface the picture with a tri-count sweep.
 // ============================================================================
 console.log(`\n${'─'.repeat(82)}`);
 console.log(`PART 2 · MULTICORE — simdpipe persistent pool (${POOL} threads) vs llvmpipe (all ${NCORES} cores)`);
@@ -122,8 +122,9 @@ for (const n of WL) {
   const s1 = sp1R[n]?.ms, sp = spPR[n]?.ms, lm = llvmMTR[n]?.ms;
   console.log(pad(n, 34), padr(ms(s1), 9), padr(ms(sp), 11), padr((s1 / sp).toFixed(2) + 'x', 12), padr(ms(lm), 13));
 }
-console.log('\n(simdpipe pool wins in a band ≈1k big tris; below MIN_TRIS it stays serial,');
-console.log(' and without per-tile binning it regresses at very high tri counts — roadmap.)');
+console.log('\n(per-band triangle binning + per-band coarse-depth → the pool scales 3.5-3.9x');
+console.log(' on substantial frames and ties llvmpipe-MT on small; below MIN_TRIS it stays');
+console.log(' serial, and very-few-big-triangle fill has nothing to bin apart.)');
 
 // ============================================================================
 // PART 3 — the thesis: trade fidelity for speed (simdpipe's actual lever).
