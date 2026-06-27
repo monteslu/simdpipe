@@ -865,13 +865,112 @@ static struct {
   _Atomic int next_band;   /* atomic work counter */
   _Atomic int shutdown;
   int started;
+  /* per-band triangle bins (CSR): bin_idx[ bin_off[b] .. bin_off[b+1] ) are the
+   * indices of triangles overlapping band b. Built once per dispatch so a worker
+   * iterates ONLY its band's triangles instead of re-clipping the whole list
+   * (the band model otherwise re-runs every triangle's setup in every band it
+   * touches — measured 39x blowup on big-triangle fill, 9x on mid balanced). */
+  int   *bin_off;          /* length nbands+1 */
+  int   *bin_idx;          /* length sum of per-triangle band spans */
+  int    bin_cap;          /* allocated capacity of bin_idx */
+  int    bin_bands_cap;    /* allocated capacity of bin_off (in bands) */
+  int    binned;           /* 1 = bins valid for this job, 0 = fall back to full list */
 } g_pool;
+
+/* Build per-band triangle bins for the current job (g_pool.verts/ntris/nbands).
+ * Two passes over the triangles: count spans → prefix-sum offsets → scatter indices.
+ * Runs single-threaded on the main thread before workers are released. Returns 0 and
+ * leaves g_pool.binned=0 if allocation fails (caller then uses the full-list path). */
+static int sp_pool_build_bins(void) {
+  int nb = g_pool.nbands, nt = g_pool.ntris;
+  const float *verts = g_pool.verts;
+  int stride = g_pool.gbuffer ? 30 : 30;  /* both layouts are 30 floats/tri */
+  if (nb + 1 > g_pool.bin_bands_cap) {
+    free(g_pool.bin_off);
+    g_pool.bin_off = (int *)malloc((size_t)(nb + 1) * sizeof(int));
+    if (!g_pool.bin_off) { g_pool.bin_bands_cap = 0; return 0; }
+    g_pool.bin_bands_cap = nb + 1;
+  }
+  int *off = g_pool.bin_off;
+  for (int b = 0; b <= nb; b++) off[b] = 0;
+  /* pass 1: per-band triangle counts (stored shifted by 1 for the prefix sum) */
+  int H = g_ctx.h;
+  for (int t = 0; t < nt; t++) {
+    const float *p = verts + (size_t)t * stride;
+    float y0 = p[1], y1 = p[11], y2 = p[21];
+    float lo = y0 < y1 ? (y0 < y2 ? y0 : y2) : (y1 < y2 ? y1 : y2);
+    float hi = y0 > y1 ? (y0 > y2 ? y0 : y2) : (y1 > y2 ? y1 : y2);
+    int iylo = (int)floorf(lo), iyhi = (int)ceilf(hi);
+    if (iylo < 0) iylo = 0; if (iyhi > H) iyhi = H;
+    if (iylo >= iyhi) continue;                 /* off-screen / degenerate in y */
+    int b0 = iylo / SP_TILE_ROWS, b1 = (iyhi - 1) / SP_TILE_ROWS;
+    if (b1 >= nb) b1 = nb - 1;
+    for (int b = b0; b <= b1; b++) off[b + 1]++;
+  }
+  /* prefix sum → offsets */
+  for (int b = 0; b < nb; b++) off[b + 1] += off[b];
+  int total = off[nb];
+  if (total > g_pool.bin_cap) {
+    free(g_pool.bin_idx);
+    g_pool.bin_idx = (int *)malloc((size_t)total * sizeof(int));
+    if (!g_pool.bin_idx) { g_pool.bin_cap = 0; return 0; }
+    g_pool.bin_cap = total;
+  }
+  /* pass 2: scatter triangle indices into each overlapped band (cursor per band) */
+  int *cur = (int *)malloc((size_t)nb * sizeof(int));
+  if (!cur) return 0;
+  for (int b = 0; b < nb; b++) cur[b] = off[b];
+  for (int t = 0; t < nt; t++) {
+    const float *p = verts + (size_t)t * stride;
+    float y0 = p[1], y1 = p[11], y2 = p[21];
+    float lo = y0 < y1 ? (y0 < y2 ? y0 : y2) : (y1 < y2 ? y1 : y2);
+    float hi = y0 > y1 ? (y0 > y2 ? y0 : y2) : (y1 > y2 ? y1 : y2);
+    int iylo = (int)floorf(lo), iyhi = (int)ceilf(hi);
+    if (iylo < 0) iylo = 0; if (iyhi > H) iyhi = H;
+    if (iylo >= iyhi) continue;
+    int b0 = iylo / SP_TILE_ROWS, b1 = (iyhi - 1) / SP_TILE_ROWS;
+    if (b1 >= nb) b1 = nb - 1;
+    for (int b = b0; b <= b1; b++) g_pool.bin_idx[cur[b]++] = t;
+  }
+  free(cur);
+  g_pool.binned = 1;
+  return 1;
+}
+
+/* Draw only the triangles whose indices are in idx[0..n) (the current band's bin). */
+static void sp_draw_triangles_binned(const float *verts, const int *idx, int n) {
+  for (int k = 0; k < n; k++) {
+    const float *p = verts + (size_t)idx[k] * 30;
+    sp_vert a, b, c;
+    a.x=p[0];a.y=p[1];a.z=p[2];a.invw=p[3];a.r=p[4];a.g=p[5];a.b=p[6];a.a=p[7];a.u=p[8];a.v=p[9];
+    b.x=p[10];b.y=p[11];b.z=p[12];b.invw=p[13];b.r=p[14];b.g=p[15];b.b=p[16];b.a=p[17];b.u=p[18];b.v=p[19];
+    c.x=p[20];c.y=p[21];c.z=p[22];c.invw=p[23];c.r=p[24];c.g=p[25];c.b=p[26];c.a=p[27];c.u=p[28];c.v=p[29];
+    sp_draw_triangle(&a, &b, &c);
+  }
+}
+static void sp_draw_gbuffer_binned(const float *verts, const int *idx, int n) {
+  for (int k = 0; k < n; k++) {
+    const float *p = verts + (size_t)idx[k] * 30;
+    sp_vert a, b, c;
+    a.x=p[0];a.y=p[1];a.z=p[2];a.invw=p[3];a.r=p[4];a.g=p[5];a.b=p[6];a.a=p[7];a.u=p[8];a.v=p[9];
+    b.x=p[10];b.y=p[11];b.z=p[12];b.invw=p[13];b.r=p[14];b.g=p[15];b.b=p[16];b.a=p[17];b.u=p[18];b.v=p[19];
+    c.x=p[20];c.y=p[21];c.z=p[22];c.invw=p[23];c.r=p[24];c.g=p[25];c.b=p[26];c.a=p[27];c.u=p[28];c.v=p[29];
+    sp_raster_gbuffer(&a, &b, &c);
+  }
+}
 
 static void sp_run_band(int band) {
   int y0 = band * SP_TILE_ROWS;
   int y1 = y0 + SP_TILE_ROWS;
   if (y1 > g_ctx.h) y1 = g_ctx.h;
   tl_clip_y0 = y0; tl_clip_y1 = y1;
+  if (g_pool.binned) {
+    const int *idx = g_pool.bin_idx + g_pool.bin_off[band];
+    int n = g_pool.bin_off[band + 1] - g_pool.bin_off[band];
+    if (g_pool.gbuffer) sp_draw_gbuffer_binned(g_pool.verts, idx, n);
+    else                sp_draw_triangles_binned(g_pool.verts, idx, n);
+    return;
+  }
   if (g_pool.gbuffer) sp_draw_gbuffer_flat(g_pool.verts, g_pool.ntris);
   else                sp_draw_triangles_flat(g_pool.verts, g_pool.ntris);
 }
@@ -917,6 +1016,9 @@ EXPORT void sp_pool_stop(void) {
   for (int i = 0; i < g_pool.nthreads; i++) pthread_join(g_pool.th[i], NULL);
   pthread_barrier_destroy(&g_pool.bar_start);
   pthread_barrier_destroy(&g_pool.bar_done);
+  free(g_pool.bin_off);  g_pool.bin_off = NULL;  g_pool.bin_bands_cap = 0;
+  free(g_pool.bin_idx);  g_pool.bin_idx = NULL;  g_pool.bin_cap = 0;
+  g_pool.binned = 0;
   g_pool.started = 0;
 }
 
@@ -924,6 +1026,11 @@ EXPORT void sp_pool_stop(void) {
 static void sp_pool_dispatch(const float *verts, int ntris, int gbuffer) {
   g_pool.verts = verts; g_pool.ntris = ntris; g_pool.gbuffer = gbuffer;
   g_pool.nbands = (g_ctx.h + SP_TILE_ROWS - 1) / SP_TILE_ROWS;
+  /* Bin triangles to bands first (main thread, before workers run) so each worker
+   * touches only its band's triangles. Build BEFORE publishing the job; if it fails
+   * to allocate, binned=0 falls back to the full-list re-clip path (still correct). */
+  g_pool.binned = 0;
+  sp_pool_build_bins();
   atomic_store(&g_pool.next_band, 0);
   pthread_barrier_wait(&g_pool.bar_start);   /* go */
   sp_drain_bands();                          /* main thread participates */
