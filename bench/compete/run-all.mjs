@@ -24,8 +24,11 @@ const __dir = dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
 const getArg = (k, d) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] : d; };
 const SIZE = getArg('--size', '512x512');
-const FRAMES = getArg('--frames', '60');
-const WARMUP = getArg('--warmup', '20');
+const FRAMES = getArg('--frames', '100');
+// Real apps render thousands of frames; V8's WASM tier-up + llvmpipe's shader
+// cache are both fully warm by then, which is the honest steady state to compare.
+// (~120 iters is where the WASM stops moving; under-warming under-reports simdpipe.)
+const WARMUP = getArg('--warmup', '120');
 const [W, H] = SIZE.split('x').map(Number);
 const NCORES = os.cpus().length;
 const POOL = Math.min(8, NCORES); // simdpipe pool size (matches its bench default)

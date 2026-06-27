@@ -287,6 +287,30 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
     u0*=iw0;u1*=iw1;u2*=iw2; vv0*=iw0;vv1*=iw1;vv2*=iw2;
   }
 
+  /* Per-triangle color shortcuts (computed once, used in the vertex-color inner
+   * loop — pure "do less work" wins on the common case):
+   *  - noclamp: barycentric weights are convex (w0,w1,w2 >= 0, sum 1), so any
+   *    interpolated attribute lies in the convex hull of the three vertex values,
+   *    i.e. within [min,max] of them. If all three rgba are already in [0,1] AND
+   *    we're not doing the perspective divide (which can push a value outside that
+   *    hull), every interpolated pixel is provably in [0,1] and the [0,1] clamp is
+   *    a no-op — skip 8 min/max ops per group. (persp breaks the hull bound.)
+   *  - const_alpha: a is the same at all three verts → its interpolation is that
+   *    constant; precompute the packed byte and skip the per-group a lerp/clamp/pack. */
+  int noclamp = !persp
+    && r0>=0.0f&&r0<=1.0f&&r1>=0.0f&&r1<=1.0f&&r2>=0.0f&&r2<=1.0f
+    && g0>=0.0f&&g0<=1.0f&&g1>=0.0f&&g1<=1.0f&&g2>=0.0f&&g2<=1.0f
+    && b0>=0.0f&&b0<=1.0f&&b1>=0.0f&&b1<=1.0f&&b2>=0.0f&&b2<=1.0f
+    && a0>=0.0f&&a0<=1.0f&&a1>=0.0f&&a1<=1.0f&&a2>=0.0f&&a2<=1.0f;
+  /* const_alpha valid only without the perspective divide: under persp the shown
+   * alpha is interp(a*iw)/interp(iw), which is not a0 even when a0==a1==a2. */
+  int const_alpha = !persp && (a0==a1)&&(a1==a2);
+  /* packed constant-alpha byte already shifted into the A field (only valid when
+   * const_alpha). MUST match the SIMD path exactly: clamp to [0,1] then
+   * trunc_sat(a*255) truncates toward zero — so use (int) truncation, NOT rounding. */
+  float aclf = a0 < 0.0f ? 0.0f : (a0 > 1.0f ? 1.0f : a0);
+  uint32_t const_a_packed = ((uint32_t)(int)(aclf*255.0f) & 0xff) << 24;
+
   int do_depth = (ctx->flags & SP_FLAG_DEPTH_TEST) != 0;
   int do_tex   = (ctx->flags & SP_FLAG_TEXTURE) != 0 && ctx->tex != NULL;
   int do_bilin = (ctx->flags & SP_FLAG_BILINEAR) != 0;
@@ -524,31 +548,40 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
         color4 = do_bilin ? sp_tex_bilinear4(u, v, passmask)   /* 4 taps/lane */
                           : sp_tex_nearest4(u, v, passmask);   /* 1 tap/lane  */
       } else {
-        /* vertex color path: interpolate rgba (factored), divide if persp, pack */
+        /* vertex color path: interpolate rgb[a] (factored), divide if persp, pack */
         v128_t r = SP_LERP(cR2, Rd0, Rd1);
         v128_t g = SP_LERP(cG2, Gd0, Gd1);
         v128_t b = SP_LERP(cB2, Bd0, Bd1);
-        v128_t a = SP_LERP(cA2, Ad0, Ad1);
+        v128_t s255 = wasm_f32x4_splat(255.0f);
+        v128_t rw;  /* 1/w for the perspective divide, shared by rgb and a */
         if (persp) {
           v128_t iw = SP_LERP(IW2, IWd0, IWd1);
-          v128_t rw = wasm_f32x4_div(wasm_f32x4_splat(1.0f), iw);
-          r=wasm_f32x4_mul(r,rw); g=wasm_f32x4_mul(g,rw); b=wasm_f32x4_mul(b,rw); a=wasm_f32x4_mul(a,rw);
+          rw = wasm_f32x4_div(wasm_f32x4_splat(1.0f), iw);
+          r=wasm_f32x4_mul(r,rw); g=wasm_f32x4_mul(g,rw); b=wasm_f32x4_mul(b,rw);
         }
-        /* clamp [0,1] -> [0,255] */
-        v128_t s255 = wasm_f32x4_splat(255.0f);
-        v128_t zero = wasm_f32x4_splat(0.0f);
-        r = wasm_f32x4_max(zero, wasm_f32x4_min(wasm_f32x4_splat(1.0f), r));
-        g = wasm_f32x4_max(zero, wasm_f32x4_min(wasm_f32x4_splat(1.0f), g));
-        b = wasm_f32x4_max(zero, wasm_f32x4_min(wasm_f32x4_splat(1.0f), b));
-        a = wasm_f32x4_max(zero, wasm_f32x4_min(wasm_f32x4_splat(1.0f), a));
+        if (!noclamp) {
+          /* clamp [0,1] (skipped when convexity proves it redundant — see above) */
+          v128_t zero = wasm_f32x4_splat(0.0f), one = wasm_f32x4_splat(1.0f);
+          r = wasm_f32x4_max(zero, wasm_f32x4_min(one, r));
+          g = wasm_f32x4_max(zero, wasm_f32x4_min(one, g));
+          b = wasm_f32x4_max(zero, wasm_f32x4_min(one, b));
+        }
         v128_t ri = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_mul(r, s255));
         v128_t gi = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_mul(g, s255));
         v128_t bi = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_mul(b, s255));
-        v128_t ai = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_mul(a, s255));
-        /* pack RGBA little-endian: R | G<<8 | B<<16 | A<<24 */
-        color4 = wasm_v128_or(
-                   wasm_v128_or(ri, wasm_i32x4_shl(gi, 8)),
-                   wasm_v128_or(wasm_i32x4_shl(bi, 16), wasm_i32x4_shl(ai, 24)));
+        /* pack RGB little-endian: R | G<<8 | B<<16; alpha folded in below */
+        v128_t rgb = wasm_v128_or(wasm_v128_or(ri, wasm_i32x4_shl(gi, 8)),
+                                  wasm_i32x4_shl(bi, 16));
+        if (const_alpha) {
+          /* alpha constant across the triangle → OR the precomputed A byte */
+          color4 = wasm_v128_or(rgb, wasm_i32x4_splat((int)const_a_packed));
+        } else {
+          v128_t a = SP_LERP(cA2, Ad0, Ad1);
+          if (persp) a = wasm_f32x4_mul(a, rw);  /* reuse rgb's 1/w */
+          if (!noclamp) a = wasm_f32x4_max(wasm_f32x4_splat(0.0f), wasm_f32x4_min(wasm_f32x4_splat(1.0f), a));
+          v128_t ai = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_mul(a, s255));
+          color4 = wasm_v128_or(rgb, wasm_i32x4_shl(ai, 24));
+        }
       }
 
       /* write masked: blend optional */
@@ -627,6 +660,16 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
  * for "this pixel was written by some triangle this pass and passed depth". */
 static float *g_gb_u, *g_gb_v, *g_gb_r, *g_gb_g, *g_gb_b, *g_gb_a;
 static uint8_t *g_gb_cover;
+
+/* Varying-usage mask for the G-buffer pass (set by the JIT layer from the shader
+ * AST). Bit 0 = U/V used (shader samples a texture), bit 1 = color (R/G/B/A) used.
+ * When a varying isn't read by the kernel, the rasterizer skips interpolating AND
+ * storing its plane(s) — pure bandwidth savings on the shade-bound (G-buffer-write-
+ * bound) path. Defaults to all-used so an un-set mask is always correct. */
+static int g_gb_varymask = 0x3;
+EXPORT void sp_gbuffer_set_varymask(int m) { g_gb_varymask = m; }
+#define SP_VARY_UV    0x1
+#define SP_VARY_COLOR 0x2
 
 EXPORT int sp_gbuffer_init(void) {
   size_t n = (size_t)g_ctx.w * g_ctx.h + 4;
@@ -777,20 +820,23 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
             pass=wasm_v128_and(pass,wasm_f32x4_lt(z,zbuf));
             if(!wasm_v128_any_true(pass)) continue;
           }
-          /* interpolate the 6 varyings (persp-divide if needed) */
+          /* interpolate the varyings the shader actually reads (persp-divide if
+           * needed). Skipping unused planes is the shade-path bandwidth win. */
           v128_t recip=one4;
           if (persp) {
             v128_t iw=wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(w0,wasm_f32x4_splat(iw0)),wasm_f32x4_mul(w1,wasm_f32x4_splat(iw1))),wasm_f32x4_mul(w2,wasm_f32x4_splat(iw2)));
             recip=wasm_f32x4_div(one4,iw);
           }
           #define GB_INTERP(A_,B_,C_) wasm_f32x4_mul(wasm_f32x4_add(wasm_f32x4_add(wasm_f32x4_mul(w0,wasm_f32x4_splat(A_)),wasm_f32x4_mul(w1,wasm_f32x4_splat(B_))),wasm_f32x4_mul(w2,wasm_f32x4_splat(C_))),recip)
-          v128_t U=GB_INTERP(u0,u1,u2), V=GB_INTERP(vv0,vv1,vv2);
-          v128_t R=GB_INTERP(r0,r1,r2), G=GB_INTERP(g0,g1,g2);
-          v128_t B=GB_INTERP(b0,b1,b2), A=GB_INTERP(a0,a1,a2);
-          #undef GB_INTERP
-          /* masked plane writes: keep existing where !pass (read-modify-write) */
           #define GB_STORE(PLANE,VAL) wasm_v128_store(PLANE+base, wasm_v128_bitselect(VAL, wasm_v128_load(PLANE+base), pass))
-          GB_STORE(gu,U); GB_STORE(gv,V); GB_STORE(gr,R); GB_STORE(gg,G); GB_STORE(gb,B); GB_STORE(ga,A);
+          if (g_gb_varymask & SP_VARY_UV) {
+            GB_STORE(gu, GB_INTERP(u0,u1,u2)); GB_STORE(gv, GB_INTERP(vv0,vv1,vv2));
+          }
+          if (g_gb_varymask & SP_VARY_COLOR) {
+            GB_STORE(gr, GB_INTERP(r0,r1,r2)); GB_STORE(gg, GB_INTERP(g0,g1,g2));
+            GB_STORE(gb, GB_INTERP(b0,b1,b2)); GB_STORE(ga, GB_INTERP(a0,a1,a2));
+          }
+          #undef GB_INTERP
           #undef GB_STORE
           if (do_depth) {
             wasm_v128_store(depthBuf+base, wasm_v128_bitselect(z, wasm_v128_load(depthBuf+base), pass));
