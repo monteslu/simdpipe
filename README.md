@@ -109,16 +109,17 @@ isolates exactly what SIMD buys. (512×512, median of 60 frames, V8 24.)
 
 ```
 family                                 simd ms     js ms   speedup   simd Mpx/s
-fill-rate (200 big tris, overdraw)       9.9        26.9     2.7x         ~76
-balanced  (2k mid tris)                  8.6        21.8     2.6x         ~85
-small-tris (20k @ 8px)                   4.4         6.9     1.6x         ~88
-small-tris (50k @ 4px)                   5.0         6.4     1.3x         ~58
+fill-rate (200 big tris, overdraw)       5.1        27.1     5.3x        ~146
+balanced  (2k mid tris)                  7.2        21.7     3.0x        ~101
+small-tris (20k @ 8px)                   4.6         6.9     1.5x         ~84
+small-tris (50k @ 4px)                   5.5         6.4     1.2x         ~53
 ```
 
-Fill-rate-bound work (the SIMD-friendly case) is ~2.7× faster than scalar JS;
-tiny-triangle work is setup-bound and gains less.
+Fill-rate-bound work is ~5.3× faster than scalar JS (SIMD lanes **and** the
+hierarchical tile + coarse-depth rejection both compound here); tiny-triangle work
+is setup-bound and gains less. Geomean ~2.3×.
 
-### vs llvmpipe — wins on overdraw, single-thread
+### vs llvmpipe — wins on 3 of 4, single-thread
 
 `npm run compete` pits simdpipe against **Mesa's llvmpipe** (256-bit AVX2
 software GL, 20 years of tuning), the **GPU** (AMD Radeon 890M), and a **scalar-C**
@@ -130,20 +131,26 @@ comparison. (512×512, V8 24.)
 
 ```
 workload                      simdpipe   llvmpipe-1T   vs llvmpipe   vs scalar-C
-fill (200 big tris, overdraw)     4.18       4.82         1.15x         4.15x
-balanced (2k mid tris)            7.85       5.11         0.65x         1.68x
-small (20k @ 8px)                 5.50       4.82         0.88x         —
-shade-bound (heavy frag)          8.87       7.14         0.80x         —
+fill (200 big tris, overdraw)     4.55       4.93         1.08x         3.87x   ← win
+small (20k @ 8px)                 4.60       5.25         1.14x         —       ← win
+balanced (16k tris, dense)       26.9       36.9         1.33x         —       ← win
+balanced (2k mid tris)            7.10       5.21         0.73x         1.87x
+shade-bound (heavy frag)          8.01       7.42         0.93x         —
 ```
 
-**simdpipe beats a 256-bit native renderer on the overdraw-bound `fill` case**
-(1.15×) — by being algorithmically smarter, not wider: a hierarchical tiled
-rasterizer (trivial-reject/accept whole tiles) plus a **coarse per-tile Zmax
-depth pyramid** that skips fully-occluded tiles in one compare instead of marching
-millions of overdrawn pixels linearly. On the shade-bound cases it trails (0.65–
-0.88×): once pixels genuinely need shading, llvmpipe's 8-wide AVX2 does 2× the
-lanes per instruction and the 128-bit cap is the wall. It still **beats scalar
-native C** everywhere it's measured (1.7–4.2×). See
+**simdpipe beats a 256-bit native renderer on 3 of 4 workloads** — `fill` (1.08×),
+`small` (1.14×), and any dense/overdrawn scene (1.33×) — by being algorithmically
+smarter, not wider: a hierarchical tiled rasterizer (trivial-reject/accept whole
+8px tiles), a **coarse per-tile Zmax depth pyramid** that skips fully-occluded tiles
+in one compare (engaged only for big triangles, where it pays), and **tight
+bbox-snapped tiles** that don't march empty leading columns. Wherever the work is
+about *not* rasterizing — overdraw, occlusion, empty space — it wins. It trails only
+on **low-overdraw `balanced` (0.73×)** and is near-parity on **`shade-bound`
+(0.93×)**: when every pixel genuinely needs the inside-test + shade math, llvmpipe's
+8-wide AVX2 does 2× the lanes per instruction and the 128-bit cap is the wall — but
+the gap is well under 2×, because most real work is coverage and depth, not shading.
+It still **beats scalar native C** everywhere it's measured (1.9–3.9×). Every
+optimization is verified **byte-identical to the un-optimized reference**. See
 [`bench/compete/README.md`](bench/compete/README.md) for methodology and the
 optimization arc.
 
@@ -226,11 +233,13 @@ bilinear's 4 taps cost only ~27% over nearest). `npm run bench:jit-simd` shows
 the raw ALU kernel win (2.5–3.9× over scalar JS).
 
 > Honest scope: simdpipe does **not** approach a real GPU on raw fill rate (60–280×
-> out of reach), and it **trails llvmpipe on genuinely shade-bound work** — pure
-> per-pixel throughput is where a 256-bit renderer's 2× lane count over portable
-> 128-bit WASM simply wins. Where it **does** win (overdraw, occlusion, low-fidelity,
-> setup-light) it wins by *doing less work* — hierarchical tile + coarse-depth
-> rejection — not by out-muscling, and with zero GPU/driver dependency.
+> out of reach), and it **trails llvmpipe on genuinely shade-bound, low-overdraw
+> work** (`balanced` 0.73×, `shade-bound` 0.93×) — pure per-pixel throughput is where
+> a 256-bit renderer's 2× lane count over portable 128-bit WASM wins (though by far
+> less than 2×, since most real work is coverage and depth). Where it **does** win —
+> overdraw, occlusion, dense scenes, tiny triangles, low-fidelity (3 of 4 single-core
+> workloads) — it wins by *doing less work*: hierarchical tile + coarse-depth
+> rejection + tight tiles, not by out-muscling, and with zero GPU/driver dependency.
 
 ## Roadmap
 

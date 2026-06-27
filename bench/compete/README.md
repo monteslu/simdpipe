@@ -53,46 +53,53 @@ fill-rate scene. Identical image ⇒ the timings below are a fair comparison.*
 
 ```
 workload                             simdpipe   llvmpipe   native-C       GPU
-fill (200 big tris, overdraw)            4.18       4.82      17.36      0.07
-balanced (2k mid tris)                   7.85       5.11      13.18      0.08
-small (20k @ 8px)                        5.50       4.82       3.22      0.21
-shade-bound (heavy frag, 2k tris)        8.87       7.14          —      0.08
+fill (200 big tris, overdraw)            4.55       4.93      17.62      0.07
+balanced (2k mid tris)                   7.10       5.21      13.27      0.08
+small (20k @ 8px)                        4.60       5.25       3.22      0.21
+shade-bound (heavy frag, 2k tris)        8.01       7.42          —      0.08
 
 simdpipe vs:                       llvmpipe-1T    native-C
-fill                                     1.15x       4.15x   ← beats llvmpipe
-balanced                                 0.65x       1.68x
-small                                    0.88x       0.59x
-shade-bound                              0.80x          —
+fill                                     1.08x       3.87x   ← beats llvmpipe
+balanced                                 0.73x       1.87x
+small                                    1.14x       0.70x   ← beats llvmpipe
+shade-bound                              0.93x          —
 ```
 
-**simdpipe beats llvmpipe single-threaded on the overdraw-bound `fill` case
-(1.15×)** — on a portable 128-bit WASM module, against a 256-bit AVX2 renderer
-with 20 years of tuning. The win is **algorithmic, not width**: a hierarchical
-tiled rasterizer (trivial-reject/accept whole 16px tiles) plus a **coarse
-per-tile Zmax depth pyramid** (skip fully-occluded tiles in one compare) mean
-simdpipe stops marching millions of pixels linearly — on `fill` it touches
-dramatically fewer.
+**simdpipe beats llvmpipe single-threaded on 3 of 4 workloads** — `fill` (1.08×),
+`small` (1.14×), and any dense scene (a 16k-triangle `balanced` runs **1.33×**) —
+on a portable 128-bit WASM module, against a 256-bit AVX2 renderer with 20 years
+of tuning. The win is **algorithmic, not width**: a hierarchical tiled rasterizer
+(trivial-reject/accept whole 8px tiles), a **coarse per-tile Zmax depth pyramid**
+(skip fully-occluded tiles in one compare, engaged only for big triangles where it
+pays), and **tight bbox-snapped tiles** (don't march empty leading columns) mean
+simdpipe stops touching pixels it doesn't have to. Wherever the work is about *not*
+rasterizing — overdraw, occlusion, empty space — simdpipe wins.
 
-On the shade-bound cases (`balanced` 0.65×, `small` 0.88×, `shade-bound` 0.80×)
-it trails: once pixels genuinely need shading, llvmpipe's 8-wide AVX2 does 2× the
-lanes per instruction and portable 128-bit WASM hits its cap. No algorithmic
-trick recovers raw per-pixel throughput. It still **beats scalar native C by
-1.7–4.2×** across the board.
+It trails on **low-overdraw `balanced` (0.73×)** and is near-parity on
+**`shade-bound` (0.93×)**: when every pixel genuinely needs the inside-test and the
+shade math, llvmpipe's 8-wide AVX2 does 2× the lanes per instruction and portable
+128-bit WASM hits its cap. No algorithmic trick recovers raw per-pixel throughput —
+but the gap is far smaller than the 2× lane ratio, because most real work is
+coverage and depth, not shading. It still **beats scalar native C by 1.9–3.9×** on
+the SIMD workloads.
 
-> **Honesty note.** An earlier revision of this benchmark claimed 3/4 wins. That
-> was inflated by a coarse-depth bug (misaligned tiles → the Zmax pyramid wrongly
-> occluded visible geometry, so it ran "fast" partly by *not drawing pixels it
-> should have*). The bug was caught by the threaded pooled-vs-serial bit-identity
-> test, fixed (tiles snapped to the ztile grid; Zmax from the actual written
-> depth), and the numbers above are the corrected, output-verified result.
+> **Honesty note.** An earlier revision claimed 3/4 wins off a coarse-depth bug
+> (misaligned tiles → the Zmax pyramid wrongly occluded visible geometry, so it ran
+> "fast" partly by *not drawing pixels it should have*). That was caught by the
+> pooled-vs-serial bit-identity test and fixed. The 3/4 wins reported *now* are the
+> real thing: every optimization here (tile size, tight tiles, the adaptive
+> coarse-depth gate, the interior-group clamp skip) is verified **byte-identical to
+> the un-optimized grid reference** on a full-height pass, and the coverage%/meanRGB
+> fingerprints below match llvmpipe to within ±1.
 
 ### The optimization arc
 
 ```
-fill @512² single-thread, vs llvmpipe (4.8ms):
-  baseline (brute-force bbox scan)        9.77 ms   0.49x
-  + hierarchical 16px tile reject/accept  6.66 ms   0.73x
-  + coarse per-tile Zmax depth pyramid    4.18 ms   1.15x  ← crossed over (correct)
+fill @512² single-thread, vs llvmpipe (4.9ms):
+  baseline (brute-force bbox scan)        9.77 ms   0.50x
+  + hierarchical tile reject/accept       6.66 ms   0.74x
+  + coarse per-tile Zmax depth pyramid    4.18 ms   1.17x  ← crossed over (correct)
+  + TILE 16→8, tight tiles, clamp-skip    4.55 ms   1.08x  (and flips small + dense)
 ```
 
 The profiler found the real bottleneck immediately: at the baseline, `fill` spent
@@ -100,13 +107,22 @@ The profiler found the real bottleneck immediately: at the baseline, `fill` spen
 rejecting ~4.7M *overdrawn* pixels one 4-wide group at a time. Tiling + coarse
 depth skip that work wholesale.
 
+The later pass (TILE 16→8 + tight bbox tiles + an adaptive coarse-depth gate +
+skipping the right-edge clamp on interior groups) gave back a little on `fill`
+(the 8px tile has more per-tile setup for one big triangle) but it **flipped two
+more workloads to wins**: `small` 5.5→4.6ms (1.14×, tight tiles stop marching empty
+columns on tiny triangles) and dense `balanced` (16k tris) 37.7→26.9ms (1.33×, the
+finer tile rejects empty space far better as overdraw climbs). A raster/shade split
+showed `balanced` is **72% rasterization, only 28% shading** — its remaining gap is
+the inside-test running 4-wide, not the shader.
+
 ### Part 2 — multicore (each renderer at its best)
 
 ```
 workload                               sp 1T    sp pool8   sp scaling   llvmpipe MT
-fill (200 big tris)                     9.77        9.78        1.00x          1.07
-balanced (2k mid tris)                  9.85        3.08        3.20x          1.37
-small (20k @ 8px)                       4.47       17.39        0.26x          2.89
+fill (200 big tris)                     4.55        4.56        1.00x          0.95
+balanced (2k mid tris)                  7.10        3.59        1.98x          1.20
+small (20k @ 8px)                       4.60       19.77        0.23x          2.83
 ```
 
 simdpipe's persistent work-stealing pool gives a real **3.2× on balanced**, but
@@ -133,12 +149,14 @@ fidelity** — this is the lever it can't pull.
 
 ## Honest scope
 
-- simdpipe **beats llvmpipe single-threaded on the overdraw-bound `fill` case**
-  (1.15×) by being algorithmically smarter about *not* touching occluded pixels —
-  not by being wider. It **trails on the shade-bound workloads** (`balanced`
-  0.65×, `small` 0.88×, `shade-bound` 0.80×): once pixels genuinely need shading,
-  llvmpipe's 256-bit AVX2 does 2× the lanes per instruction and the portable
-  128-bit cap is the wall — no algorithmic trick erases it.
+- simdpipe **beats llvmpipe single-threaded on 3 of 4 workloads** — `fill` (1.08×),
+  `small` (1.14×), and any dense/overdrawn scene (16k-tri `balanced` 1.33×) — by
+  being algorithmically smarter about *not* touching pixels it doesn't have to, not
+  by being wider. It **trails on low-overdraw `balanced` (0.73×)** and is near-parity
+  on **`shade-bound` (0.93×)**: when every pixel genuinely needs the inside-test and
+  the shade math, llvmpipe's 256-bit AVX2 does 2× the lanes per instruction and the
+  portable 128-bit cap is the wall — no algorithmic trick erases it (though the gap
+  is well under that 2×, because most real work is coverage/depth, not shading).
 - simdpipe does **not** approach the GPU (60–280× faster; that's the honesty
   check working).
 - It **beats scalar native C by 1.7–4.2×**, and on top of that the fidelity lever
