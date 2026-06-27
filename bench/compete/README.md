@@ -53,27 +53,30 @@ fill-rate scene. Identical image ⇒ the timings below are a fair comparison.*
 
 ```
 workload                             simdpipe   llvmpipe   native-C       GPU
-fill (200 big tris, overdraw)            4.55       4.93      17.62      0.07
-balanced (2k mid tris)                   7.10       5.21      13.27      0.08
-small (20k @ 8px)                        4.60       5.25       3.22      0.21
-shade-bound (heavy frag, 2k tris)        8.01       7.42          —      0.08
+fill (200 big tris, overdraw)            4.09       4.81      17.43      0.07
+balanced (2k mid tris)                   6.48       5.10      13.25      0.08
+small (20k @ 8px)                        4.19       5.05       3.20      0.21
+shade-bound (heavy frag, 2k tris)        7.90       7.16          —      0.08
 
 simdpipe vs:                       llvmpipe-1T    native-C
-fill                                     1.08x       3.87x   ← beats llvmpipe
-balanced                                 0.73x       1.87x
-small                                    1.14x       0.70x   ← beats llvmpipe
-shade-bound                              0.93x          —
+fill                                     1.18x       4.27x   ← beats llvmpipe
+balanced                                 0.79x       2.05x
+small                                    1.20x       0.76x   ← beats llvmpipe
+shade-bound                              0.91x          —
 ```
 
-**simdpipe beats llvmpipe single-threaded on 3 of 4 workloads** — `fill` (1.08×),
-`small` (1.14×), and any dense scene (a 16k-triangle `balanced` runs **1.33×**) —
+**simdpipe beats llvmpipe single-threaded on 3 of 4 workloads** — `fill` (1.18×),
+`small` (1.20×), and any dense scene (a 16k-triangle `balanced` runs **1.33×**) —
 on a portable 128-bit WASM module, against a 256-bit AVX2 renderer with 20 years
 of tuning. The win is **algorithmic, not width**: a hierarchical tiled rasterizer
 (trivial-reject/accept whole 8px tiles), a **coarse per-tile Zmax depth pyramid**
 (skip fully-occluded tiles in one compare, engaged only for big triangles where it
-pays), and **tight bbox-snapped tiles** (don't march empty leading columns) mean
-simdpipe stops touching pixels it doesn't have to. Wherever the work is about *not*
-rasterizing — overdraw, occlusion, empty space — simdpipe wins.
+pays), **tight bbox-snapped tiles** (don't march empty leading columns), and an
+**affine fast path** (a triangle whose three 1/w are equal needs no per-pixel
+perspective divide — its interpolated 1/w is constant, so the divide is exactly the
+affine result; detected per triangle, byte-identical, drops a `div` per group on all
+2D/UI/flat geometry, exactly as llvmpipe does). Wherever the work is about *not*
+rasterizing — overdraw, occlusion, empty space, redundant math — simdpipe wins.
 
 It trails on **low-overdraw `balanced` (0.73×)** and is near-parity on
 **`shade-bound` (0.93×)**: when every pixel genuinely needs the inside-test and the
@@ -100,6 +103,7 @@ fill @512² single-thread, vs llvmpipe (4.9ms):
   + hierarchical tile reject/accept       6.66 ms   0.74x
   + coarse per-tile Zmax depth pyramid    4.18 ms   1.17x  ← crossed over (correct)
   + TILE 16→8, tight tiles, clamp-skip    4.55 ms   1.08x  (and flips small + dense)
+  + affine fast path (skip persp divide)  4.09 ms   1.18x  (byte-identical; flat geom)
 ```
 
 The profiler found the real bottleneck immediately: at the baseline, `fill` spent

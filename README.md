@@ -131,26 +131,28 @@ comparison. (512×512, V8 24.)
 
 ```
 workload                      simdpipe   llvmpipe-1T   vs llvmpipe   vs scalar-C
-fill (200 big tris, overdraw)     4.55       4.93         1.08x         3.87x   ← win
-small (20k @ 8px)                 4.60       5.25         1.14x         —       ← win
-balanced (16k tris, dense)       26.9       36.9         1.33x         —       ← win
-balanced (2k mid tris)            7.10       5.21         0.73x         1.87x
-shade-bound (heavy frag)          8.01       7.42         0.93x         —
+fill (200 big tris, overdraw)     4.09       4.81         1.18x         4.27x   ← win
+small (20k @ 8px)                 4.19       5.05         1.20x         —       ← win
+balanced (16k tris, dense)       25.5       36.9         1.33x         —       ← win
+balanced (2k mid tris)            6.48       5.10         0.79x         2.05x
+shade-bound (heavy frag)          7.90       7.16         0.91x         —
 ```
 
-**simdpipe beats a 256-bit native renderer on 3 of 4 workloads** — `fill` (1.08×),
-`small` (1.14×), and any dense/overdrawn scene (1.33×) — by being algorithmically
+**simdpipe beats a 256-bit native renderer on 3 of 4 workloads** — `fill` (1.18×),
+`small` (1.20×), and any dense/overdrawn scene (1.33×) — by being algorithmically
 smarter, not wider: a hierarchical tiled rasterizer (trivial-reject/accept whole
 8px tiles), a **coarse per-tile Zmax depth pyramid** that skips fully-occluded tiles
-in one compare (engaged only for big triangles, where it pays), and **tight
-bbox-snapped tiles** that don't march empty leading columns. Wherever the work is
-about *not* rasterizing — overdraw, occlusion, empty space — it wins. It trails only
-on **low-overdraw `balanced` (0.73×)** and is near-parity on **`shade-bound`
-(0.93×)**: when every pixel genuinely needs the inside-test + shade math, llvmpipe's
-8-wide AVX2 does 2× the lanes per instruction and the 128-bit cap is the wall — but
-the gap is well under 2×, because most real work is coverage and depth, not shading.
-It still **beats scalar native C** everywhere it's measured (1.9–3.9×). Every
-optimization is verified **byte-identical to the un-optimized reference**. See
+in one compare (engaged only for big triangles, where it pays), **tight bbox-snapped
+tiles** that don't march empty leading columns, and an **affine fast path** that drops
+the per-pixel perspective divide on flat geometry (byte-identical — a constant 1/w
+makes the divide a no-op). Wherever the work is about *not* rasterizing — overdraw,
+occlusion, empty space, redundant math — it wins. It trails only on **low-overdraw
+`balanced` (0.79×)** and is near-parity on **`shade-bound` (0.91×)**: when every pixel
+genuinely needs the inside-test + shade math, llvmpipe's 8-wide AVX2 does 2× the lanes
+per instruction and the 128-bit cap is the wall — but the gap is well under 2×,
+because most real work is coverage and depth, not shading. It still **beats scalar
+native C** everywhere it's measured (2.0–4.3×). Every optimization is verified
+**byte-identical to the un-optimized reference**. See
 [`bench/compete/README.md`](bench/compete/README.md) for methodology and the
 optimization arc.
 
