@@ -61,14 +61,14 @@ fill (200 big tris, overdraw)            3.27       4.80      17.50      0.07
 balanced (2k mid tris)                   5.34       5.14      13.37      0.08
 dense (16k mid tris)                    23.47      37.43      93.55      0.16
 small (20k @ 8px)                        3.40       4.55       3.20      0.20
-shade-bound (heavy frag, 2k tris)        7.65       7.20          —      0.09
+shade-bound (heavy frag, 2k tris)        7.49       7.20          —      0.09
 
 simdpipe vs:                       llvmpipe-1T    native-C
 fill                                     1.47x       5.36x   ← beats llvmpipe
 balanced (2k, low density)               0.96x       2.50x      (parity; crosses to a win at ~4k)
 dense (16k mid tris)                     1.59x       3.99x   ← beats llvmpipe
 small                                    1.34x       0.94x   ← beats llvmpipe
-shade-bound                              0.94x          —       (parity)
+shade-bound                              0.96x          —       (parity)
 ```
 
 The `balanced` 2k row is the one place simdpipe doesn't pull ahead — and it's at
@@ -81,7 +81,7 @@ linearly. Real frames have the density; this loss only shows at toy sizes.
 
 **simdpipe beats llvmpipe single-threaded on every realistic workload** — `fill`
 (**1.47×**), `small` (**1.34×**), `dense` 16k-triangle (**1.59×**) — and is at parity
-on the two synthetic worst cases (`balanced`-2k 0.96×, `shade-bound` 0.94×), on a
+on the two synthetic worst cases (`balanced`-2k 0.96×, `shade-bound` 0.96×), on a
 portable 128-bit WASM module, against a 256-bit AVX2 renderer with 20 years of tuning.
 The win is **algorithmic, not width**: a hierarchical tiled rasterizer
 (trivial-reject/accept whole 8px tiles), a **coarse per-tile Zmax depth pyramid**
@@ -99,7 +99,7 @@ G-buffer channels the shader actually reads. Wherever the work is about *not*
 rasterizing — overdraw, occlusion, empty space, redundant math — simdpipe wins.
 
 The two non-wins are at **parity, not defeat**: `balanced`-2k (0.96×, which flips to a
-win past ~4k triangles) and `shade-bound` (0.94×). At low overdraw every pixel
+win past ~4k triangles) and `shade-bound` (0.96×). At low overdraw every pixel
 genuinely needs the inside-test and the per-pixel shade ALU, and llvmpipe's 8-wide
 AVX2 does 2× the lanes per instruction while portable 128-bit WASM hits its cap — but
 the gap is a few percent, far under the 2× lane ratio, because most real work is
@@ -107,7 +107,10 @@ coverage and depth, not raw ALU. It still **beats scalar native C by 2.5–5.4×
 SIMD workloads. (Earlier `balanced` was a 0.79× loss; the convexity / constant-alpha /
 varying-mask shortcuts closed it to parity and widened every actual win — a clamp
 that's provably a no-op is the purest "do less work" there is, and llvmpipe always
-pays it.)
+pays it. `shade-bound` was 0.94×; an **N-wide unrolled JIT kernel** — emitting 4
+groups' independent sin chains back-to-back so the engine overlaps them, ILP instead
+of wider vectors — closed it to 0.96×, byte-identical, the honest last squeeze toward
+the equal-fidelity wall.)
 
 > **Honesty note.** An earlier revision overstated its wins off a coarse-depth bug
 > (misaligned tiles → the Zmax pyramid wrongly occluded visible geometry, so it ran
@@ -242,7 +245,7 @@ Dropping bilinear→nearest alone is **3.4×**; going all the way to flat vertex
   doing redundant per-pixel math it can prove away), not by being wider.
 - It is at **parity, not a loss**, on the two synthetic worst cases: toy-density
   `balanced` (2k, 0.96×) — which **crosses over to a win at ~4k triangles** (1.59× by
-  16k, 1.84× by 32k) — and `shade-bound` (0.94×). At low overdraw every pixel needs
+  16k, 1.84× by 32k) — and `shade-bound` (0.96×). At low overdraw every pixel needs
   the inside-test + per-pixel ALU, where llvmpipe's 8 lanes beat our 4; once there's
   realistic density, coarse-depth + tile reject win. No toy size is the wall on real
   frames. (Convexity-clamp-skip + constant-alpha + a varying-plane mask — all byte-

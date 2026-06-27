@@ -135,7 +135,7 @@ fill (200 big tris, overdraw)     3.27       4.80         1.47x         5.36x   
 small (20k @ 8px)                 3.40       4.55         1.34x         —       ← win
 dense (16k mid tris)             23.5       37.4         1.59x         3.99x   ← win
 balanced (2k mid tris)            5.34       5.14         0.96x         2.50x
-shade-bound (heavy frag)          7.65       7.20         0.94x         —
+shade-bound (heavy frag)          7.49       7.20         0.96x         —
 ```
 
 The lone `balanced` near-tie is a low-density artifact: at a trivially-low 2k triangles
@@ -180,7 +180,7 @@ instead of per-pixel, and stop the shade pass writing G-buffer channels the shad
 never reads. Wherever the work is about *not* rasterizing — overdraw, occlusion, empty
 space, redundant math — it wins. It is at **parity on the two synthetic worst cases**:
 toy-density `balanced` (2k, 0.96×, which flips to a win past 4k triangles) and
-`shade-bound` (0.94×), where every pixel genuinely needs the inside-test + shade math
+`shade-bound` (0.96×), where every pixel genuinely needs the inside-test + shade math
 and llvmpipe's 8-wide AVX2 does 2× the lanes per instruction — but even there the gap
 is a few percent, not the 2× a pure width argument predicts, because most real work is
 coverage and depth, not per-pixel ALU. It still **beats scalar native C** everywhere
@@ -274,7 +274,7 @@ the raw ALU kernel win (2.5–3.9× over scalar JS).
 > Honest scope: simdpipe does **not** approach a real GPU on raw fill rate (60–280×
 > out of reach), and it sits at **parity (not ahead) on the two synthetic worst
 > cases** — flat-shaded `balanced` at a toy 2k triangles (0.96×, flips to a win past
-> ~4k: 1.59× at 16k, 1.84× at 32k) and `shade-bound` (0.94×). Those are the cases
+> ~4k: 1.59× at 16k, 1.84× at 32k) and `shade-bound` (0.96×). Those are the cases
 > where every pixel genuinely needs the inside-test and the per-pixel shade ALU, so a
 > 256-bit renderer's 2× lane count over portable 128-bit WASM is the wall — yet the
 > gap is a few percent, not the 2× pure width predicts, because most real work is
