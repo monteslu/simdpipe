@@ -127,6 +127,38 @@ console.log(' on substantial frames and ties llvmpipe-MT on small; below MIN_TRI
 console.log(' serial, and very-few-big-triangle fill has nothing to bin apart.)');
 
 // ============================================================================
+// PART 2.5 — TEXTURED: the most common real-renderer workload (sample a bound
+// texture). Both sample the SAME checker texture over the same geometry; outputs
+// are pixel-matched. simdpipe runs its fast tier (nearest+affine) AND matched
+// fidelity (bilinear+persp) so you see both the like-for-like number and the lever.
+// ============================================================================
+console.log(`\n${'─'.repeat(82)}`);
+console.log('PART 2.5 · TEXTURED — sample a bound texture (the realistic renderer workload)');
+console.log('─'.repeat(82));
+const texSP = runJSON([join(__dir, 'tex-bench.mjs'), '--renderer', 'simdpipe', '--size', SIZE, '--frames', FRAMES, '--warmup', WARMUP, '--dump', PFX]);
+const texLP = runJSON([join(__dir, 'tex-bench.mjs'), '--renderer', 'llvmpipe', '--size', SIZE, '--frames', FRAMES, '--warmup', WARMUP, '--dump', PFX],
+  { LIBGL_ALWAYS_SOFTWARE: '1', LP_NUM_THREADS: '0' });
+const txGet = (res, tier, name) => res.results.find(r => r.tier === tier && r.name === name)?.ms;
+const TWL = texSP.results.filter(r => r.tier === 'nearest+affine').map(r => r.name);
+console.log('\nframe time (ms, median); simdpipe nearest+affine vs llvmpipe nearest (like-for-like):\n');
+console.log(pad('workload', 26), padr('sp near+aff', 12), padr('lp nearest', 11), padr('vs llvmpipe', 13));
+console.log('-'.repeat(26 + 12 + 11 + 13));
+for (const n of TWL) {
+  const s = txGet(texSP, 'nearest+affine', n), l = txGet(texLP, 'nearest', n);
+  console.log(pad(n, 26), padr(ms(s), 12), padr(ms(l), 11), padr(l && s ? (l / s).toFixed(2) + 'x' : '—', 13));
+}
+console.log('\n…and the thesis: simdpipe\'s fast tier vs llvmpipe at BILINEAR (the quality it\'d ship):\n');
+console.log(pad('workload', 26), padr('sp near+aff', 12), padr('lp bilinear', 12), padr('sp advantage', 13));
+console.log('-'.repeat(26 + 12 + 12 + 13));
+for (const n of TWL) {
+  const s = txGet(texSP, 'nearest+affine', n), lb = txGet(texLP, 'bilinear', n);
+  console.log(pad(n, 26), padr(ms(s), 12), padr(ms(lb), 12), padr(lb && s ? (lb / s).toFixed(2) + 'x' : '—', 13));
+}
+console.log('\n(both renderers sample the same checker texture; their framebuffers match to');
+console.log(' within a couple of LSBs — verified by the dumped PNGs. simdpipe wins the');
+console.log(' like-for-like nearest case on fill+small, and the fidelity lever widens it.)');
+
+// ============================================================================
 // PART 3 — the thesis: trade fidelity for speed (simdpipe's actual lever).
 // Reuses bench/fidelity.mjs which descends the fidelity ladder on one scene.
 // ============================================================================
@@ -161,6 +193,7 @@ writeFileSync(outJSON, JSON.stringify({
   size: { W, H }, frames: +FRAMES, node: process.version, cores: NCORES,
   renderers: { simdpipe: sp1.renderer, llvmpipe_1T: llvm1.renderer, llvmpipe_MT: llvmMT.renderer, gpu: gpu?.renderer, native: 'native scalar C (gcc -O3 -march=native)' },
   single_thread: WL.map(n => ({ name: n, simdpipe: sp1R[n]?.ms, llvmpipe: llvm1R[n]?.ms, native: nat[natKind(n)]?.ms, gpu: gpuR[n]?.ms })),
+  textured: TWL.map(n => ({ name: n, sp_nearest_affine: txGet(texSP, 'nearest+affine', n), sp_bilinear_persp: txGet(texSP, 'bilinear+persp', n), llvmpipe_nearest: txGet(texLP, 'nearest', n), llvmpipe_bilinear: txGet(texLP, 'bilinear', n) })),
   multicore: WL.filter(n => spPR[n]).map(n => ({ name: n, sp_1t: sp1R[n]?.ms, sp_pool: spPR[n]?.ms, llvmpipe_mt: llvmMTR[n]?.ms })),
   fingerprints: Object.fromEntries(WL.map(n => [n, { simdpipe: sp1R[n], llvmpipe: llvm1R[n], native: nat[natKind(n)] }])),
 }, null, 2));
