@@ -138,12 +138,26 @@ balanced (2k mid tris)            6.48       5.10         0.79x         2.05x
 shade-bound (heavy frag)          7.90       7.16         0.91x         —
 ```
 
-**simdpipe beats a 256-bit native renderer on 3 of 4 workloads** — `fill` (1.18×),
-`small` (1.20×), and any dense/overdrawn scene (1.33×) — by being algorithmically
-smarter, not wider: a hierarchical tiled rasterizer (trivial-reject/accept whole
-8px tiles), a **coarse per-tile Zmax depth pyramid** that skips fully-occluded tiles
-in one compare (engaged only for big triangles, where it pays), **tight bbox-snapped
-tiles** that don't march empty leading columns, and an **affine fast path** that drops
+**Textured** (the workload real renderers actually run — same checker texture, both
+single-thread, outputs pixel-matched):
+
+```
+workload                      simdpipe   llvmpipe-1T   vs llvmpipe (both nearest)
+fill (200 big tris)               4.13       5.39         1.30x   ← win
+small (20k @ 8px)                 4.13       5.79         1.40x   ← win
+balanced (2k mid tris)            6.62       6.03         0.91x
+```
+
+…and simdpipe's fast nearest+affine tier beats llvmpipe at **bilinear** (the quality
+it'd ship) on **all three** — fill 1.54×, small 1.71×, balanced 1.15×.
+
+**simdpipe beats a 256-bit native renderer on most workloads** — vertex-color `fill`
+(1.18×), `small` (1.20×), dense scenes (1.33×), and textured `fill`/`small`
+(1.30–1.40×) — by being algorithmically smarter, not wider: a hierarchical tiled
+rasterizer (trivial-reject/accept whole 8px tiles), a **coarse per-tile Zmax depth
+pyramid** that skips fully-occluded tiles in one compare (engaged only for big
+triangles, where it pays), **tight bbox-snapped tiles** that don't march empty leading
+columns, and an **affine fast path** that drops
 the per-pixel perspective divide on flat geometry (byte-identical — a constant 1/w
 makes the divide a no-op). Wherever the work is about *not* rasterizing — overdraw,
 occlusion, empty space, redundant math — it wins. It trails only on **low-overdraw

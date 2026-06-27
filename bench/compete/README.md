@@ -120,6 +120,36 @@ finer tile rejects empty space far better as overdraw climbs). A raster/shade sp
 showed `balanced` is **72% rasterization, only 28% shading** — its remaining gap is
 the inside-test running 4-wide, not the shader.
 
+### Part 2.5 — textured (the realistic renderer workload)
+
+Real renderers sample textures; this is the workload that matters most, and it's
+simdpipe's strongest. Both renderers sample the **same** 256² checker over the same
+geometry (simdpipe's fixed-function single-pass texture path vs llvmpipe's GLSL
+`texture()`), framebuffers pixel-matched to within a couple of LSBs.
+
+```
+                                    sp near+aff   llvmpipe nearest   vs llvmpipe
+fill (200 big tris)                      4.13           5.39            1.30x   ← win
+small (20k @ 8px)                        4.13           5.79            1.40x   ← win
+balanced (2k mid tris)                   6.62           6.03            0.91x
+```
+
+simdpipe wins the **like-for-like nearest** case on `fill` and `small`. And against
+llvmpipe at **bilinear** — the quality a real app actually ships — simdpipe's fast
+nearest+affine tier wins **all three**:
+
+```
+                                    sp near+aff   llvmpipe bilinear   sp advantage
+fill (200 big tris)                      4.13           6.35            1.54x
+small (20k @ 8px)                        4.13           7.07            1.71x
+balanced (2k mid tris)                   6.62           7.59            1.15x
+```
+
+The in-kernel SIMD texture gather (by-hand, no JS) plus tight tiles + coarse depth
+carry the like-for-like wins; the fidelity lever (simdpipe drops to nearest/affine
+when it doesn't need bilinear/perspective, llvmpipe always pays full) carries the
+rest. This is the thesis in one table.
+
 ### Part 2 — multicore (each renderer at its best)
 
 ```
