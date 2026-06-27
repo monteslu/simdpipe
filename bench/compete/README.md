@@ -119,17 +119,27 @@ the inside-test running 4-wide, not the shader.
 ### Part 2 — multicore (each renderer at its best)
 
 ```
-workload                               sp 1T    sp pool8   sp scaling   llvmpipe MT
-fill (200 big tris)                     4.55        4.56        1.00x          0.95
-balanced (2k mid tris)                  7.10        3.59        1.98x          1.20
-small (20k @ 8px)                       4.60       19.77        0.23x          2.83
+workload                              sp 1T   sp pool12   sp scaling   llvmpipe MT
+fill (200 big tris)                    4.55       4.54        1.00x          0.91
+fill (6k big tris)                    27.4       10.0        2.74x             —
+balanced (2k mid tris)                 7.10       1.96        3.62x          1.20
+balanced (16k tris, dense)            26.9        6.83       3.94x             —
+small (20k @ 8px)                      4.60       2.69        1.71x          2.69
 ```
 
-simdpipe's persistent work-stealing pool gives a real **3.2× on balanced**, but
-its win is a **narrow band (~1k big triangles)**: below `SP_POOL_MIN_TRIS` it
-stays serial, and **without per-tile binning it re-runs triangle setup per band
-and regresses at high tri counts** (the roadmap's #1 item). llvmpipe's mature
-tile-binned threading scales smoothly. This is surfaced, not hidden.
+simdpipe's persistent work-stealing pool now **scales 3.6–3.9× on the substantial
+workloads** and **ties llvmpipe-MT on `small`**. Two fixes got it there:
+**per-band coarse-depth** (each worker owns its ztile rows exclusively — the grid is
+row-major and bands are disjoint, so no lock) and **per-band triangle binning** (the
+band model used to re-run every triangle's setup in every band it touched — a 39×
+blowup on big-triangle fill; now each band iterates only the triangles binned to it).
+Heavy 6k-tri fill went from a 2.5× regression-prone path to **4.1× and faster than
+the static band-spawn**.
+
+It still trails llvmpipe-MT in absolute terms on most frames — llvmpipe has lower
+per-frame sync overhead and 24 vs 12 effective threads here — and `fill` with only
+200 big triangles can't parallelize (nothing to bin apart). True 2D per-tile binning
+would tighten `balanced` further. Surfaced, not hidden.
 
 ### Part 3 — the thesis: trade fidelity for speed
 

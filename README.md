@@ -170,14 +170,18 @@ threads   ms     speedup
 ```
 
 A **persistent worker pool** (`npm run bench:pool`) goes further: created once,
-with atomic tile-row dispatch (work-stealing, so uneven scenes load-balance) and
-no per-frame thread spawn. On a heavy fill-bound frame it hits **5.0× over serial**
-and beats the per-frame band spawn — with **bit-identical** output. (Threading
-only helps on substantial frames; pooled draws fall back to serial below a small
-work threshold, since WASM barrier sync isn't free on trivial frames.)
+with atomic tile-row dispatch (work-stealing, so uneven scenes load-balance), no
+per-frame thread spawn, **per-band triangle binning** (each worker only touches the
+triangles binned to its rows, not the whole list re-clipped), and **per-band
+coarse-depth** (each band owns its Zmax rows exclusively — no lock). On a heavy
+6k-triangle fill it hits **4.1× over serial** and beats the per-frame band spawn —
+with **bit-identical** output. At 512² the pool scales **3.6–3.9× on balanced/dense
+scenes** and ties llvmpipe-MT on tiny triangles. (Threading only helps on substantial
+frames; pooled draws fall back to serial below a small work threshold, since WASM
+barrier sync isn't free on trivial frames.)
 
-**SIMD (~2.7×) × threads (~5×) stacks to roughly an order of magnitude over scalar
-JS on fill-bound work.** All numbers are machine-dependent — run them yourself.
+**SIMD (~5× on fill) × threads (~4×) stacks to well over an order of magnitude over
+scalar JS on fill-bound work.** All numbers are machine-dependent — run them yourself.
 
 ### Fidelity ladder — "trade fidelity for speed", quantified
 
@@ -251,8 +255,9 @@ the raw ALU kernel win (2.5–3.9× over scalar JS).
 - [x] GL-shaped front end — MVP transform, vertex stage, `drawArrays`, spinning textured cube
 - [x] Fidelity ladder — bilinear/nearest, perspective/affine, texture/flat (~3.5× span)
 - [x] **Hierarchical tiled rasterizer + coarse per-tile Zmax depth pyramid** — beats llvmpipe single-thread on 3/4 workloads (overdraw/occlusion-bound)
-- [ ] Thread-safe coarse-depth (per-band private Zmax rows) — bring the overdraw win to the multicore pool too
-- [ ] Scene-level triangle binning (one tile = one parallel work unit; fixes the pool's high-tri regression)
+- [x] **Thread-safe coarse-depth** (per-band private Zmax rows — the grid is row-major, bands are disjoint, so each band owns its rows with no lock) — brings the overdraw win to the pool
+- [x] **Per-band triangle binning** (each worker iterates only its band's triangles, not the whole list re-clipped) — kills the 39× setup blowup; heavy fill 2.5×→4.1×, beats static band-spawn
+- [ ] True 2D per-tile binning (one tile = one parallel work unit) — tighten the pool on mid/dense scenes further
 - [ ] Swizzled/tiled texture layout (cache-locality win over the linear gather)
 - [ ] Conformant WebGL2 / GL ES 3.0 API surface
 - [ ] More fidelity knobs (MSAA off + post-AA, fp16, fast-math, RGB565, …)
