@@ -60,7 +60,7 @@ workload                             simdpipe   llvmpipe   native-C       GPU
 fill (200 big tris, overdraw)            2.65       4.84      17.50      0.07
 balanced (2k mid tris)                   5.21       5.16      13.37      0.08
 dense (16k mid tris)                    23.35      38.93      93.55      0.16
-small (20k @ 8px)                        3.46       4.76       3.20      0.20
+small (20k @ 8px)                        3.34       4.76       3.20      0.20
 shade-bound (heavy frag, 2k tris)        7.45       7.29          —      0.09
 shade-bound + coarse (2×1 VRS)           6.95       7.29          —      0.09
 
@@ -68,7 +68,7 @@ simdpipe vs:                       llvmpipe-1T    native-C
 fill                                     1.83x       6.6x    ← beats llvmpipe (adaptive 16px tile)
 balanced (2k, low density)               0.99x       2.5x        (tie; crosses to a win at ~4k)
 dense (16k mid tris)                     1.67x       4.0x    ← beats llvmpipe
-small                                    1.38x       0.94x   ← beats llvmpipe
+small                                    1.42x       0.94x   ← beats llvmpipe
 shade-bound (full fidelity)              0.98x          —       (near-tie at equal fidelity)
 shade-bound + coarse (2×1 VRS)           1.05x          —    ← beats llvmpipe (fidelity lever)
 ```
@@ -89,7 +89,7 @@ scales while llvmpipe pays
 linearly. Real frames have the density; this only shows at toy sizes.
 
 **simdpipe beats llvmpipe single-threaded on every realistic workload** — `fill`
-(**1.60×**), `small` (**1.38×**), `dense` 16k-triangle (**1.67×**) — and is a tie
+(**1.83×**), `small` (**1.42×**), `dense` 16k-triangle (**1.67×**) — and is a tie
 on the two synthetic worst cases (`balanced`-2k 0.99×, `shade-bound` 0.98×), on a
 portable 128-bit WASM module, against a 256-bit AVX2 renderer with 20 years of tuning.
 The win is **algorithmic, not width**: a hierarchical tiled rasterizer
@@ -119,7 +119,7 @@ V8 spills the doubled live register set; the wall is WASM's 16×128-bit register
 not the algorithm.) It still **beats scalar native C by 2.5–5.4×** on the SIMD
 workloads. (Earlier `balanced` was a 0.79× loss; the convexity / const-alpha /
 varying-mask shortcuts closed it to parity, then incremental z-step + ×255-fold closed
-it to a tie and lifted `fill` to 1.60× / `dense` to 1.67×. `shade-bound` was 0.94×; an
+it to a tie and lifted `fill` to 1.83× (adaptive tile) / `dense` to 1.67×. `shade-bound` was 0.94×; an
 **N-wide unrolled JIT kernel** — emitting 4 groups' independent sin chains back-to-back
 so the engine overlaps them, ILP instead of wider vectors — took it to 0.96×, then
 **relaxed-SIMD fused multiply-add** in the JIT kernel — one rounding per `a*b+c` across
@@ -259,7 +259,7 @@ Dropping bilinear→nearest alone is **3.4×**; going all the way to flat vertex
 ## Honest scope
 
 - simdpipe **beats llvmpipe single-threaded on every realistic workload** — vertex-
-  color `fill` (**1.60×**), `small` (1.38×), `dense` (**1.67×**) **and** the textured
+  color `fill` (**1.83×**), `small` (1.42×), `dense` (**1.67×**) **and** the textured
   sweep (`fill` 1.32×, `small` 1.44×, and **dense textured 3.23×** — the rout) — by
   being algorithmically smarter about *not* touching pixels it doesn't have to (and not
   doing redundant per-pixel math it can prove away), not by being wider.
