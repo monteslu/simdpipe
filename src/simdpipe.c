@@ -269,6 +269,10 @@ static inline v128_t sp_tex_bilinear4(v128_t u, v128_t v, v128_t mask) {
  * touch the same framebuffer pixel → zero locking. Defaults cover full height. */
 static _Thread_local int tl_clip_y0 = 0;
 static _Thread_local int tl_clip_y1 = 1 << 30;
+/* x-clip for 2D pool tiling (few-big-triangle frames that y-bands can't split): a
+ * worker owns a screen column strip too. Default = whole width (no x restriction). */
+static _Thread_local int tl_clip_x0 = 0;
+static _Thread_local int tl_clip_x1 = 1 << 30;
 
 /* The core triangle rasterizer. Verts are in screen space. */
 EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert *v2) {
@@ -294,9 +298,11 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
   int miny = (int)floorf(minyf); int maxy = (int)ceilf(maxyf);
   if (minx < 0) minx = 0; if (miny < 0) miny = 0;
   if (maxx > W) maxx = W; if (maxy > H) maxy = H;
-  /* clamp to this thread's band */
+  /* clamp to this thread's band (y) and, for 2D pool tiling, its column strip (x) */
   if (miny < tl_clip_y0) miny = tl_clip_y0;
   if (maxy > tl_clip_y1) maxy = tl_clip_y1;
+  if (minx < tl_clip_x0) minx = tl_clip_x0;
+  if (maxx > tl_clip_x1) maxx = tl_clip_x1;
   if (minx >= maxx || miny >= maxy) return;
 
   /* edge setup: E_i(x,y) = A_i*x + B_i*y + C_i.
@@ -428,7 +434,11 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
    * single-thread / small-frame-fallback path owns the whole height and trivially
    * satisfies this.) A band whose edges don't align (shouldn't happen) just skips. */
   int band_aligned = (tl_clip_y0 % TILE == 0)
-                     && (tl_clip_y1 % TILE == 0 || tl_clip_y1 >= ctx->h);
+                     && (tl_clip_y1 % TILE == 0 || tl_clip_y1 >= ctx->h)
+                     /* 2D pool tiling: the x-strip must be cell-aligned too, so
+                      * x-disjoint workers touch disjoint ztile columns (no race). */
+                     && (tl_clip_x0 % TILE == 0)
+                     && (tl_clip_x1 % TILE == 0 || tl_clip_x1 >= ctx->w);
   int do_ztile = do_depth && ctx->ztile != NULL && band_aligned;
   /* Coarse depth only pays off when a triangle covers enough tiles to actually
    * occlude later overdraw — its per-cell Zmax bookkeeping + reject test is pure
@@ -481,7 +491,8 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
    * B_i*(y+0.5)+C_i is recomputed from the ABSOLUTE row origin each scanline (never
    * accumulated across tile seams), so a pixel's edge value is the same regardless of
    * where its 16px tile begins. */
-  int owns_full = (tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h);
+  int owns_full = (tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h
+                   && tl_clip_x0 <= 0 && tl_clip_x1 >= ctx->w);
   int tyStart, txStart;
 #ifdef SP_FORCE_GRID_TILES
   if (1)
@@ -819,7 +830,11 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
   /* coarse-depth: safe for a banded worker as long as its band falls on ztile-cell
    * boundaries (it then owns those rows exclusively) — see sp_draw_triangle. */
   int band_aligned = (tl_clip_y0 % TILE == 0)
-                     && (tl_clip_y1 % TILE == 0 || tl_clip_y1 >= ctx->h);
+                     && (tl_clip_y1 % TILE == 0 || tl_clip_y1 >= ctx->h)
+                     /* 2D pool tiling: the x-strip must be cell-aligned too, so
+                      * x-disjoint workers touch disjoint ztile columns (no race). */
+                     && (tl_clip_x0 % TILE == 0)
+                     && (tl_clip_x1 % TILE == 0 || tl_clip_x1 >= ctx->w);
   int do_ztile = do_depth && ctx->ztile != NULL && band_aligned;
   {  /* engage only for big triangles — see sp_draw_triangle */
     int tcw = ((maxx - 1) / TILE) - (minx / TILE) + 1;
@@ -849,7 +864,8 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
   /* grid-snap when ztile active OR this call doesn't own the full height (banded
    * worker); tight bbox start only for a full-height serial pass (see
    * sp_draw_triangle — output-invariant, pool-safe). */
-  int owns_full = (tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h);
+  int owns_full = (tl_clip_y0 <= 0 && tl_clip_y1 >= ctx->h
+                   && tl_clip_x0 <= 0 && tl_clip_x1 >= ctx->w);
   int tyStart, txStart;
   if (do_ztile || !owns_full) { tyStart = (miny/TILE)*TILE; txStart = (minx/TILE)*TILE; }
   else                        { tyStart = miny;             txStart = minx; }
@@ -1059,6 +1075,7 @@ static struct {
   int    bin_bands_cap;    /* allocated capacity of bin_off (in bands) */
   int   *bin_cur;          /* persistent per-band scatter cursor (avoid per-frame malloc) */
   int    binned;           /* 1 = bins valid for this job, 0 = fall back to full list */
+  int    xsplit;           /* x-strips for 2D tiling (>1 for few-big-triangle frames) */
 } g_pool;
 
 /* Build per-band triangle bins for the current job (g_pool.verts/ntris/nbands).
@@ -1144,11 +1161,28 @@ static void sp_draw_gbuffer_binned(const float *verts, const int *idx, int n) {
   }
 }
 
-static void sp_run_band(int band) {
+static void sp_run_band(int cell) {
+  /* 2D tiling: cell = strip * nbands + band → (y-band, x-strip). xsplit==1 is the
+   * plain y-band path (x-clip stays full width). x-strips are TILE-aligned so the
+   * ztile grid stays per-cell-disjoint across workers. Used for few-big-triangle
+   * frames (fill) that y-bands alone can't split — each worker owns a 2D region. */
+  int xs = g_pool.xsplit;
+  int band = (xs > 1) ? (cell % g_pool.nbands) : cell;
+  int strip = (xs > 1) ? (cell / g_pool.nbands) : 0;
   int y0 = band * SP_TILE_ROWS;
   int y1 = y0 + SP_TILE_ROWS;
   if (y1 > g_ctx.h) y1 = g_ctx.h;
   tl_clip_y0 = y0; tl_clip_y1 = y1;
+  if (xs > 1) {
+    /* strip width rounded up to a multiple of the tile so cells are cell-aligned */
+    int sw = ((g_ctx.w + xs - 1) / xs + (SP_RASTER_TILE - 1)) & ~(SP_RASTER_TILE - 1);
+    int x0 = strip * sw, x1 = x0 + sw;
+    if (x1 > g_ctx.w) x1 = g_ctx.w;
+    tl_clip_x0 = x0; tl_clip_x1 = x1;
+    if (x0 >= x1) return;
+  } else {
+    tl_clip_x0 = 0; tl_clip_x1 = 1 << 30;
+  }
   if (g_pool.binned) {
     const int *idx = g_pool.bin_idx + g_pool.bin_off[band];
     int n = g_pool.bin_off[band + 1] - g_pool.bin_off[band];
@@ -1161,10 +1195,11 @@ static void sp_run_band(int band) {
 }
 
 static void sp_drain_bands(void) {
+  int ncells = g_pool.nbands * (g_pool.xsplit > 1 ? g_pool.xsplit : 1);
   for (;;) {
-    int band = atomic_fetch_add(&g_pool.next_band, 1);
-    if (band >= g_pool.nbands) break;
-    sp_run_band(band);
+    int cell = atomic_fetch_add(&g_pool.next_band, 1);
+    if (cell >= ncells) break;
+    sp_run_band(cell);
   }
 }
 
@@ -1211,6 +1246,21 @@ EXPORT void sp_pool_stop(void) {
 static void sp_pool_dispatch(const float *verts, int ntris, int gbuffer) {
   g_pool.verts = verts; g_pool.ntris = ntris; g_pool.gbuffer = gbuffer;
   g_pool.nbands = (g_ctx.h + SP_TILE_ROWS - 1) / SP_TILE_ROWS;
+  /* 2D tiling for FEW-BIG-triangle frames: when there are too few triangles to fill
+   * the bands but each is large (spans many bands), y-band binning leaves every band
+   * with ~all the triangles and the work doesn't split. Adding an x-split gives each
+   * worker a 2D region so a big triangle's pixels are divided across cores. Engage it
+   * only at low triangle counts (where y-bands underutilize the pool); pick enough
+   * strips to keep ~one cell per thread but strips ≥64px (finer wastes setup). */
+  if (ntris > 0 && ntris <= 512 && g_pool.nthreads > 1) {
+    int maxStrips = g_ctx.w / 64; if (maxStrips < 1) maxStrips = 1;
+    int want = (g_pool.nthreads + g_pool.nbands - 1) / g_pool.nbands; /* ≥1 */
+    if (want < 2) want = 2;                       /* low tri count → force a 2D split */
+    if (want > maxStrips) want = maxStrips;
+    g_pool.xsplit = want;
+  } else {
+    g_pool.xsplit = 1;
+  }
   /* Bin triangles to bands first (main thread, before workers run) so each worker
    * touches only its band's triangles. Build BEFORE publishing the job; if it fails
    * to allocate, binned=0 falls back to the full-list re-clip path (still correct). */
@@ -1220,17 +1270,44 @@ static void sp_pool_dispatch(const float *verts, int ntris, int gbuffer) {
   pthread_barrier_wait(&g_pool.bar_start);   /* go */
   sp_drain_bands();                          /* main thread participates */
   pthread_barrier_wait(&g_pool.bar_done);    /* join */
+  /* The main thread participated in the drain, so its thread-local clips were left at
+   * the last cell it ran. Reset them to full so a subsequent DIRECT serial draw on the
+   * main thread (sp_draw_triangles_flat) isn't confined to a stale band/strip. */
+  tl_clip_y0 = 0; tl_clip_y1 = 1 << 30;
+  tl_clip_x0 = 0; tl_clip_x1 = 1 << 30;
 }
 
 /* Below this triangle count, barrier/dispatch overhead exceeds the parallel win,
  * so run serially. (WASM futex-based barrier latency makes fine-grained sync
  * costly; only amortizes on substantial frames.) Tunable. */
 #define SP_POOL_MIN_TRIS 256
+/* …UNLESS the few triangles are big: a low-count frame whose triangles each cover a
+ * large area (fill-style overdraw) has plenty of parallelizable PIXEL work even though
+ * the triangle COUNT is low — the 2D x-split divides it across cores. Pool down to this
+ * count when the mean bbox span is large. */
+#define SP_POOL_MIN_TRIS_BIG 32
+
+/* Decide whether a low-count frame is worth pooling: true if its triangles are big
+ * enough (mean bbox span ≥ ~half the screen) that the pixel work amortizes the sync. */
+static int sp_pool_worth_big(const float *verts, int ntris) {
+  if (ntris < SP_POOL_MIN_TRIS_BIG) return 0;
+  int ns = ntris < 64 ? ntris : 64;
+  float sum = 0.0f;
+  for (int t = 0; t < ns; t++) {
+    const float *p = verts + (size_t)t * 30;
+    float x0=p[0],x1=p[10],x2=p[20], y0=p[1],y1=p[11],y2=p[21];
+    float xmn=x0<x1?(x0<x2?x0:x2):(x1<x2?x1:x2), xmx=x0>x1?(x0>x2?x0:x2):(x1>x2?x1:x2);
+    float ymn=y0<y1?(y0<y2?y0:y2):(y1<y2?y1:y2), ymx=y0>y1?(y0>y2?y0:y2):(y1>y2?y1:y2);
+    sum += (xmx - xmn) + (ymx - ymn);
+  }
+  return (sum / (float)ns) >= (float)(g_ctx.w + g_ctx.h) * 0.25f;
+}
 
 /* Pooled fixed-function draw (color path). Falls back to serial if no pool or if
- * the frame is too small to amortize thread sync. */
+ * the frame is too small to amortize thread sync (unless its few triangles are big). */
 EXPORT void sp_draw_triangles_pooled(const float *verts, int ntris) {
-  if (!g_pool.started || ntris < SP_POOL_MIN_TRIS) { sp_draw_triangles_flat(verts, ntris); return; }
+  if (!g_pool.started) { sp_draw_triangles_flat(verts, ntris); return; }
+  if (ntris < SP_POOL_MIN_TRIS && !sp_pool_worth_big(verts, ntris)) { sp_draw_triangles_flat(verts, ntris); return; }
   /* pick the tile ONCE before releasing workers (they all read ctx->tile + the grid);
    * SP_TILE_ROWS(16) % {8,16} == 0 so bands stay cell-aligned at either tile. */
   if (g_ctx.adapt_tile) sp_pick_tile(verts, ntris);
