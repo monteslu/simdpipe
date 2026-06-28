@@ -341,6 +341,13 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
   v128_t U2=wasm_f32x4_splat(u2), Ud0=wasm_f32x4_splat(u0-u2), Ud1=wasm_f32x4_splat(u1-u2);
   v128_t V2=wasm_f32x4_splat(vv2), Vd0=wasm_f32x4_splat(vv0-vv2), Vd1=wasm_f32x4_splat(vv1-vv2);
   v128_t Z2v=wasm_f32x4_splat(v2->z), Zd0=wasm_f32x4_splat(v0->z - v2->z), Zd1=wasm_f32x4_splat(v1->z - v2->z);
+#ifdef SP_FAST
+  /* SP_FAST pack: distribute the *255 into the interp constants once per triangle so
+   * the noclamp pack does interp→trunc with NO per-group *255 (3 fewer muls/group). */
+  v128_t cR2x=wasm_f32x4_splat(r2*255.0f), Rd0x=wasm_f32x4_splat((r0-r2)*255.0f), Rd1x=wasm_f32x4_splat((r1-r2)*255.0f);
+  v128_t cG2x=wasm_f32x4_splat(g2*255.0f), Gd0x=wasm_f32x4_splat((g0-g2)*255.0f), Gd1x=wasm_f32x4_splat((g1-g2)*255.0f);
+  v128_t cB2x=wasm_f32x4_splat(b2*255.0f), Bd0x=wasm_f32x4_splat((b0-b2)*255.0f), Bd1x=wasm_f32x4_splat((b1-b2)*255.0f);
+#endif
   /* a == base + w0*d0 + w1*d1 */
   #define SP_LERP(base,d0,d1) wasm_f32x4_add(base, wasm_f32x4_add(wasm_f32x4_mul(w0,d0), wasm_f32x4_mul(w1,d1)))
 
@@ -400,6 +407,13 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
   float Bz = vz0 * B0 + vz1 * B1 + vz2 * B2;
   float Cz = vz0 * C0 + vz1 * C1 + vz2 * C2;
   const int zxpos = (Az >= 0.0f), zypos = (Bz >= 0.0f); /* corner pick for z min/max */
+#ifdef SP_FAST
+  /* SP_FAST: step z incrementally (1 add/group) instead of the factored barycentric
+   * z-lerp (2 mul + 2 add) that runs on EVERY group. z is the affine plane
+   * Az*x+Bz*y+Cz — mathematically equals the barycentric z; ~maxΔ1 FP diff. */
+  v128_t zStepX = wasm_f32x4_splat(Az * 4.0f);
+  v128_t zLane  = wasm_f32x4_mul(wasm_f32x4_splat(Az), lane_offset);
+#endif
   /* For edge i, the "min corner" (E smallest) uses xlo if A_i>=0 else xhi, and
    * ylo if B_i>=0 else yhi; the "max corner" is the opposite. Precompute which. */
   const int x0pos0 = (A0 >= 0.0f), x0pos1 = (A1 >= 0.0f), x0pos2 = (A2 >= 0.0f);
@@ -479,10 +493,16 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
     v128_t w0 = wasm_f32x4_add(wasm_f32x4_splat(row0), A0lane);
     v128_t w1 = wasm_f32x4_add(wasm_f32x4_splat(row1), A1lane);
     v128_t w2 = wasm_f32x4_add(wasm_f32x4_splat(row2), A2lane);
+#ifdef SP_FAST
+    v128_t zrow = wasm_f32x4_add(wasm_f32x4_splat(Az * fminx + Bz * yc + Cz), zLane);
+#endif
 
     for (int x = tx; x < txend; x += 4,
          w0 = wasm_f32x4_add(w0, stepX0),
          w1 = wasm_f32x4_add(w1, stepX1),
+#ifdef SP_FAST
+         zrow = wasm_f32x4_add(zrow, zStepX),
+#endif
          w2 = wasm_f32x4_add(w2, stepX2)) {
       v128_t inside;
       if (tile_full) {
@@ -517,7 +537,11 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
 
       /* interpolate depth (always linear in screen space; factored — runs for
        * every group incl. depth-rejected ones, so the saved mul matters most here) */
+#ifdef SP_FAST
+      v128_t z = zrow;   /* incrementally stepped (1 add/group) */
+#else
       v128_t z = SP_LERP(Z2v, Zd0, Zd1);
+#endif
 
       int base = y * W + x;
       v128_t passmask = inside;
@@ -548,6 +572,18 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
         color4 = do_bilin ? sp_tex_bilinear4(u, v, passmask)   /* 4 taps/lane */
                           : sp_tex_nearest4(u, v, passmask);   /* 1 tap/lane  */
       } else {
+#ifdef SP_FAST
+        if (noclamp && const_alpha) {
+          /* fastest pack: interp straight into [0,255] (pre-scaled deltas), no clamp,
+           * no per-group *255, constant alpha OR'd in (3 fewer muls/group). */
+          v128_t ri = wasm_i32x4_trunc_sat_f32x4(SP_LERP(cR2x, Rd0x, Rd1x));
+          v128_t gi = wasm_i32x4_trunc_sat_f32x4(SP_LERP(cG2x, Gd0x, Gd1x));
+          v128_t bi = wasm_i32x4_trunc_sat_f32x4(SP_LERP(cB2x, Bd0x, Bd1x));
+          color4 = wasm_v128_or(wasm_v128_or(ri, wasm_i32x4_shl(gi, 8)),
+                     wasm_v128_or(wasm_i32x4_shl(bi, 16), wasm_i32x4_splat((int)const_a_packed)));
+        } else
+#endif
+        {
         /* vertex color path: interpolate rgb[a] (factored), divide if persp, pack */
         v128_t r = SP_LERP(cR2, Rd0, Rd1);
         v128_t g = SP_LERP(cG2, Gd0, Gd1);
@@ -581,6 +617,7 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
           if (!noclamp) a = wasm_f32x4_max(wasm_f32x4_splat(0.0f), wasm_f32x4_min(wasm_f32x4_splat(1.0f), a));
           v128_t ai = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_mul(a, s255));
           color4 = wasm_v128_or(rgb, wasm_i32x4_shl(ai, 24));
+        }
         }
       }
 

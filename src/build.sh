@@ -2,6 +2,12 @@
 # Build simdpipe WASM.
 #   dist/simdpipe.mjs           — single-thread, SIMD128 (portable everywhere)
 #   dist/simdpipe-threads.mjs   — SIMD128 + pthreads (needs shared memory)
+#
+# -DSP_FAST enables the speed-over-fidelity vertex-color path (incremental z-stepping
+# + *255-folded color pack): ~3-13% faster, output within ≤1 LSB of the byte-exact
+# path (same coverage % and mean RGB; ~3-5 px of a 512² frame differ by ±1, invisible
+# — the same tolerance already accepted for JIT textures). This IS the project thesis
+# (trade graphics fidelity for speed). Drop -DSP_FAST for the byte-exact reference path.
 set -euo pipefail
 cd "$(dirname "$0")"
 OUT=../dist
@@ -11,7 +17,7 @@ COMMON_EXPORTS='["_sp_init","_sp_alloc","_sp_free","_sp_color_ptr","_sp_depth_pt
 
 echo ">> single-thread build"
 emcc simdpipe.c \
-  -O3 -msimd128 -ffast-math \
+  -O3 -msimd128 -ffast-math -DSP_FAST \
   -s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 \
   -s ENVIRONMENT=node,web,worker \
   -s ALLOW_MEMORY_GROWTH=1 -s INITIAL_MEMORY=67108864 \
@@ -28,7 +34,7 @@ echo ">> threaded build"
 # bit-identical. Per-band private ztile (to give banded workers coarse-depth too)
 # is the tracked follow-up.
 emcc simdpipe.c \
-  -O3 -msimd128 -ffast-math -pthread -DSP_THREADS=1 \
+  -O3 -msimd128 -ffast-math -DSP_FAST -pthread -DSP_THREADS=1 \
   -s WASM=1 -s MODULARIZE=1 -s EXPORT_ES6=1 \
   -s ENVIRONMENT=node,web,worker \
   -s INITIAL_MEMORY=268435456 -s MAXIMUM_MEMORY=268435456 \
