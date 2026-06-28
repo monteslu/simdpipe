@@ -57,31 +57,31 @@ under-reports simdpipe by measuring it before the engine finishes optimizing.
 
 ```
 workload                             simdpipe   llvmpipe   native-C       GPU
-fill (200 big tris, overdraw)            3.27       4.80      17.50      0.07
-balanced (2k mid tris)                   5.34       5.14      13.37      0.08
-dense (16k mid tris)                    23.47      37.43      93.55      0.16
-small (20k @ 8px)                        3.40       4.55       3.20      0.20
-shade-bound (heavy frag, 2k tris)        7.49       7.20          —      0.09
+fill (200 big tris, overdraw)            3.11       4.96      17.50      0.07
+balanced (2k mid tris)                   5.21       5.16      13.37      0.08
+dense (16k mid tris)                    23.35      38.93      93.55      0.16
+small (20k @ 8px)                        3.46       4.76       3.20      0.20
+shade-bound (heavy frag, 2k tris)        7.49       7.17          —      0.09
 
 simdpipe vs:                       llvmpipe-1T    native-C
-fill                                     1.47x       5.36x   ← beats llvmpipe
-balanced (2k, low density)               0.96x       2.50x      (parity; crosses to a win at ~4k)
-dense (16k mid tris)                     1.59x       3.99x   ← beats llvmpipe
-small                                    1.34x       0.94x   ← beats llvmpipe
-shade-bound                              0.96x          —       (parity)
+fill                                     1.60x       5.4x    ← beats llvmpipe
+balanced (2k, low density)               0.99x       2.5x        (tie; crosses to a win at ~4k)
+dense (16k mid tris)                     1.67x       4.0x    ← beats llvmpipe
+small                                    1.38x       0.94x   ← beats llvmpipe
+shade-bound                              0.96x          —       (tie)
 ```
 
-The `balanced` 2k row is the one place simdpipe doesn't pull ahead — and it's at
-**parity, and a density artifact**, not a wall. The same mid-triangle geometry at
-higher counts crosses over at ~4k and the gap widens: 8k → 1.19×, 16k → 1.59× (the
+The `balanced` 2k row is the one place simdpipe doesn't pull ahead — and it's now a
+**tie (0.99×), and a density artifact**, not a wall. The same mid-triangle geometry at
+higher counts crosses over at ~4k and the gap widens: 8k → 1.19×, 16k → 1.67× (the
 `dense` row above), 32k → **1.84×**. simdpipe's tile + coarse-depth machinery has a
 fixed per-triangle cost that needs a few thousand triangles to amortize; past that, it
 scales while llvmpipe pays
-linearly. Real frames have the density; this loss only shows at toy sizes.
+linearly. Real frames have the density; this only shows at toy sizes.
 
 **simdpipe beats llvmpipe single-threaded on every realistic workload** — `fill`
-(**1.47×**), `small` (**1.34×**), `dense` 16k-triangle (**1.59×**) — and is at parity
-on the two synthetic worst cases (`balanced`-2k 0.96×, `shade-bound` 0.96×), on a
+(**1.60×**), `small` (**1.38×**), `dense` 16k-triangle (**1.67×**) — and is a tie
+on the two synthetic worst cases (`balanced`-2k 0.99×, `shade-bound` 0.96×), on a
 portable 128-bit WASM module, against a 256-bit AVX2 renderer with 20 years of tuning.
 The win is **algorithmic, not width**: a hierarchical tiled rasterizer
 (trivial-reject/accept whole 8px tiles), a **coarse per-tile Zmax depth pyramid**
@@ -90,25 +90,29 @@ pays), **tight bbox-snapped tiles** (don't march empty leading columns), an
 **affine fast path** (a triangle whose three 1/w are equal needs no per-pixel
 perspective divide — its interpolated 1/w is constant, so the divide is exactly the
 affine result; detected per triangle, byte-identical, drops a `div` per group on all
-2D/UI/flat geometry, exactly as llvmpipe does), and a trio of **byte-identical pixel-
-pack shortcuts**: skip the [0,1] color clamp when barycentric convexity proves the
-interpolated value is already in range (all 3 verts in [0,1] + affine → every pixel
-in [0,1]); fold a constant vertex alpha in once instead of interpolating + packing it
-per pixel; and a varying-plane mask so the programmable shade pass only writes the
-G-buffer channels the shader actually reads. Wherever the work is about *not*
-rasterizing — overdraw, occlusion, empty space, redundant math — simdpipe wins.
+2D/UI/flat geometry, exactly as llvmpipe does), a trio of **byte-identical pixel-pack
+shortcuts** (skip the [0,1] clamp when barycentric convexity proves the value is
+already in range; fold a constant vertex alpha in once; a varying-plane mask so the
+shade pass only writes the channels the shader reads), and two **≤1-LSB speed-path
+shortcuts** (step depth incrementally — z is the affine plane `Az*x+Bz*y+Cz`, 1 add/
+group vs the factored lerp's 2 mul + 2 add, which runs on *every* group; and fold the
+×255 into the color constants). Wherever the work is about *not* rasterizing —
+overdraw, occlusion, empty space, redundant math — simdpipe wins.
 
-The two non-wins are at **parity, not defeat**: `balanced`-2k (0.96×, which flips to a
+The two non-wins are a **tie, not a defeat**: `balanced`-2k (0.99×, which flips to a
 win past ~4k triangles) and `shade-bound` (0.96×). At low overdraw every pixel
 genuinely needs the inside-test and the per-pixel shade ALU, and llvmpipe's 8-wide
 AVX2 does 2× the lanes per instruction while portable 128-bit WASM hits its cap — but
-the gap is a few percent, far under the 2× lane ratio, because most real work is
-coverage and depth, not raw ALU. It still **beats scalar native C by 2.5–5.4×** on the
-SIMD workloads. (Earlier `balanced` was a 0.79× loss; the convexity / constant-alpha /
-varying-mask shortcuts closed it to parity and widened every actual win — a clamp
-that's provably a no-op is the purest "do less work" there is, and llvmpipe always
-pays it. `shade-bound` was 0.94×; an **N-wide unrolled JIT kernel** — emitting 4
-groups' independent sin chains back-to-back so the engine overlaps them, ILP instead
+the gap is ≤1–4%, far under the 2× lane ratio, because most real work is
+coverage and depth, not raw ALU. (Measured directly: a true 8-wide path via 2×v128 —
+matching AVX2's lane count, which the 128-bit cap permits — comes out *slower*, because
+V8 spills the doubled live register set; the wall is WASM's 16×128-bit register file,
+not the algorithm.) It still **beats scalar native C by 2.5–5.4×** on the SIMD
+workloads. (Earlier `balanced` was a 0.79× loss; the convexity / const-alpha /
+varying-mask shortcuts closed it to parity, then incremental z-step + ×255-fold closed
+it to a tie and lifted `fill` to 1.60× / `dense` to 1.67×. `shade-bound` was 0.94×; an
+**N-wide unrolled JIT kernel** — emitting 4 groups' independent sin chains back-to-back
+so the engine overlaps them, ILP instead
 of wider vectors — closed it to 0.96×, byte-identical, the honest last squeeze toward
 the equal-fidelity wall.)
 
@@ -124,13 +128,14 @@ the equal-fidelity wall.)
 ### The optimization arc
 
 ```
-fill @512² single-thread, vs llvmpipe (~4.8ms):
+fill @512² single-thread, vs llvmpipe (~4.9ms):
   baseline (brute-force bbox scan)        9.77 ms   0.50x
   + hierarchical tile reject/accept       6.66 ms   0.74x
   + coarse per-tile Zmax depth pyramid    4.18 ms   1.17x  ← crossed over (correct)
   + TILE 16→8, tight tiles, clamp-skip    4.55 ms   1.08x  (and flips small + dense)
   + affine fast path (skip persp divide)  4.15 ms   1.16x  (byte-identical; flat geom)
   + convexity/const-α/varying-mask pack   3.27 ms   1.47x  (byte-identical; "do less")
+  + incremental z-step + ×255-fold pack   3.11 ms   1.60x  (≤1 LSB; the speed path)
 ```
 
 The profiler found the real bottleneck immediately: at the baseline, `fill` spent
@@ -167,10 +172,10 @@ geometry (simdpipe's fixed-function single-pass texture path vs llvmpipe's GLSL
 
 ```
                                     sp near+aff   llvmpipe nearest   vs llvmpipe
-fill (200 big tris)                      4.10           5.52            1.34x   ← win
-dense (8k big tris, overdraw)           62.5          195.9            3.14x   ← WIN
-small (20k @ 8px)                        4.13           5.50            1.33x   ← win
-balanced (2k mid tris)                   6.61           6.19            0.94x
+fill (200 big tris)                      4.12           5.44            1.32x   ← win
+dense (8k big tris, overdraw)           62.1          200.7            3.23x   ← WIN
+small (20k @ 8px)                        4.34           6.24            1.44x   ← win
+balanced (2k mid tris)                   6.69           6.10            0.91x
 ```
 
 **On dense textured overdraw simdpipe is 3× faster** — and the gap *widens* with
@@ -239,17 +244,19 @@ Dropping bilinear→nearest alone is **3.4×**; going all the way to flat vertex
 ## Honest scope
 
 - simdpipe **beats llvmpipe single-threaded on every realistic workload** — vertex-
-  color `fill` (1.47×), `small` (1.34×), `dense` (1.59×) **and** the textured sweep
-  (`fill` 1.34×, `small` 1.33×, and **dense textured 3.14×** — the rout) — by being
-  algorithmically smarter about *not* touching pixels it doesn't have to (and not
+  color `fill` (**1.60×**), `small` (1.38×), `dense` (**1.67×**) **and** the textured
+  sweep (`fill` 1.32×, `small` 1.44×, and **dense textured 3.23×** — the rout) — by
+  being algorithmically smarter about *not* touching pixels it doesn't have to (and not
   doing redundant per-pixel math it can prove away), not by being wider.
-- It is at **parity, not a loss**, on the two synthetic worst cases: toy-density
-  `balanced` (2k, 0.96×) — which **crosses over to a win at ~4k triangles** (1.59× by
+- It is a **tie, not a loss**, on the two synthetic worst cases: toy-density
+  `balanced` (2k, 0.99×) — which **crosses over to a win at ~4k triangles** (1.67× by
   16k, 1.84× by 32k) — and `shade-bound` (0.96×). At low overdraw every pixel needs
   the inside-test + per-pixel ALU, where llvmpipe's 8 lanes beat our 4; once there's
   realistic density, coarse-depth + tile reject win. No toy size is the wall on real
-  frames. (Convexity-clamp-skip + constant-alpha + a varying-plane mask — all byte-
-  identical — lifted `balanced` from a 0.79× loss to parity and widened every win.)
+  frames. (Convexity-clamp-skip + const-alpha + varying-mask lifted `balanced` from a
+  0.79× loss to parity; incremental z-step + ×255-fold then closed it to a tie. A true
+  8-wide 2×v128 path was measured *slower* — V8 spills — so the residual gap is WASM's
+  128-bit register width, not the algorithm.)
 - simdpipe does **not** approach the GPU (60–280× faster; that's the honesty
   check working).
 - It **beats scalar native C by 2.5–5.4×**, and on top of that the fidelity lever
