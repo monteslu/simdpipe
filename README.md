@@ -135,7 +135,7 @@ fill (200 big tris, overdraw)     3.11       4.96         1.60x         5.4x    
 small (20k @ 8px)                 3.46       4.76         1.38x         —       ← win
 dense (16k mid tris)             23.4       38.9         1.67x         4.0x    ← win
 balanced (2k mid tris)            5.21       5.16         0.99x         2.5x        (tie)
-shade-bound (heavy frag)          7.49       7.17         0.96x         —
+shade-bound (heavy frag)          7.45       7.29         0.98x         —
 ```
 
 The `balanced` 2k row is the last sub-1.0×, and it's now a **statistical tie** (0.99×) —
@@ -182,9 +182,10 @@ per-pixel, stop the shade pass writing G-buffer channels the shader never reads,
 group + **fold the ×255 into the color constants**. Wherever the work is about *not*
 rasterizing — overdraw, occlusion, empty space, redundant math — it wins. The two
 synthetic worst cases are now a **tie**: toy-density `balanced` (2k, 0.99×, which flips
-to a clear win past 4k triangles) and `shade-bound` (0.96×), where every pixel genuinely
-needs the inside-test + shade ALU and llvmpipe's 8-wide AVX2 does 2× the lanes per
-instruction — but even there the gap is ≤1–4%, not the 2× a pure width argument predicts,
+to a clear win past 4k triangles) and `shade-bound` (0.98×, after a relaxed-SIMD fused
+multiply-add pass in the JIT kernel), where every pixel genuinely needs the inside-test +
+shade ALU and llvmpipe's 8-wide AVX2 does 2× the lanes per instruction — but even there
+the gap is ≤1–2%, not the 2× a pure width argument predicts,
 because most real work is coverage and depth, not per-pixel ALU. It still **beats scalar
 native C** everywhere
 it's measured (2.5–5.4×). The structural optimizations (tiling, coarse-depth, affine,
@@ -282,10 +283,10 @@ the raw ALU kernel win (2.5–3.9× over scalar JS).
 > Honest scope: simdpipe does **not** approach a real GPU on raw fill rate (60–280×
 > out of reach), and it sits at a **tie (not ahead) on the two synthetic worst
 > cases** — flat-shaded `balanced` at a toy 2k triangles (0.99×, flips to a clear win
-> past ~4k: 1.67× at 16k, 1.84× at 32k) and `shade-bound` (0.96×). Those are the cases
+> past ~4k: 1.67× at 16k, 1.84× at 32k) and `shade-bound` (0.98×). Those are the cases
 > where every pixel genuinely needs the inside-test and the per-pixel shade ALU, so a
 > 256-bit renderer's 2× lane count over portable 128-bit WASM is the wall — yet the
-> gap is ≤1–4%, not the 2× pure width predicts, because most real work is coverage and
+> gap is ≤1–2%, not the 2× pure width predicts, because most real work is coverage and
 > depth, not ALU. (I measured this directly: a true 8-wide path via 2×v128 — matching
 > AVX2's lane count, which the 128-bit cap permits — comes out *slower*, because V8
 > spills the doubled live register set; the wall is WASM's 16×128-bit register file,
