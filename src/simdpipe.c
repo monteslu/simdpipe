@@ -122,6 +122,11 @@ EXPORT int sp_init(int w, int h) {
   g_ctx.color = (uint32_t *)malloc(npx * 4);
   g_ctx.depth = (float *)malloc(npx * sizeof(float));
   if (!g_ctx.color || !g_ctx.depth) return 0;
+  /* adaptive tiling on by default (zero fidelity cost, byte-identical); SP_ADAPT_TILE=0
+   * in the JS wrapper or sp_set_adapt_tile(0) pins the fixed default tile. This makes
+   * BOTH the single-thread and threaded builds pick the per-frame tile (the serial
+   * fallback for few-big-triangle scenes like fill then gets the coarse-16 win too). */
+  g_ctx.adapt_tile = 1;
   /* coarse Zmax tile grid. Allocate for the FINEST tile (8 → most cells) so a
    * coarser per-frame tile reuses the same buffer; tiles_w/h track the CURRENT tile. */
   g_ctx.tile = SP_RASTER_TILE;
@@ -1052,6 +1057,7 @@ static struct {
   int   *bin_idx;          /* length sum of per-triangle band spans */
   int    bin_cap;          /* allocated capacity of bin_idx */
   int    bin_bands_cap;    /* allocated capacity of bin_off (in bands) */
+  int   *bin_cur;          /* persistent per-band scatter cursor (avoid per-frame malloc) */
   int    binned;           /* 1 = bins valid for this job, 0 = fall back to full list */
 } g_pool;
 
@@ -1064,9 +1070,10 @@ static int sp_pool_build_bins(void) {
   const float *verts = g_pool.verts;
   int stride = g_pool.gbuffer ? 30 : 30;  /* both layouts are 30 floats/tri */
   if (nb + 1 > g_pool.bin_bands_cap) {
-    free(g_pool.bin_off);
+    free(g_pool.bin_off); free(g_pool.bin_cur);
     g_pool.bin_off = (int *)malloc((size_t)(nb + 1) * sizeof(int));
-    if (!g_pool.bin_off) { g_pool.bin_bands_cap = 0; return 0; }
+    g_pool.bin_cur = (int *)malloc((size_t)(nb + 1) * sizeof(int));
+    if (!g_pool.bin_off || !g_pool.bin_cur) { g_pool.bin_bands_cap = 0; return 0; }
     g_pool.bin_bands_cap = nb + 1;
   }
   int *off = g_pool.bin_off;
@@ -1094,9 +1101,10 @@ static int sp_pool_build_bins(void) {
     if (!g_pool.bin_idx) { g_pool.bin_cap = 0; return 0; }
     g_pool.bin_cap = total;
   }
-  /* pass 2: scatter triangle indices into each overlapped band (cursor per band) */
-  int *cur = (int *)malloc((size_t)nb * sizeof(int));
-  if (!cur) return 0;
+  /* pass 2: scatter triangle indices into each overlapped band (cursor per band).
+   * Cursor buffer is persistent (sized with bin_off) — no per-frame malloc/free. */
+  if (nb + 1 > g_pool.bin_bands_cap) { /* (bin_off realloc above already grew bands_cap) */ }
+  int *cur = g_pool.bin_cur;
   for (int b = 0; b < nb; b++) cur[b] = off[b];
   for (int t = 0; t < nt; t++) {
     const float *p = verts + (size_t)t * stride;
@@ -1110,7 +1118,6 @@ static int sp_pool_build_bins(void) {
     if (b1 >= nb) b1 = nb - 1;
     for (int b = b0; b <= b1; b++) g_pool.bin_idx[cur[b]++] = t;
   }
-  free(cur);
   g_pool.binned = 1;
   return 1;
 }

@@ -62,6 +62,7 @@ if (THREADS > 0) {
   M = await createThreads();
   M._sp_init(W, H);
   M._sp_set_flags(FLAGS_USE);
+  if (M._sp_set_adapt_tile && process.env.SP_ADAPT_TILE !== '0') M._sp_set_adapt_tile(1);
   M._sp_pool_start(THREADS);
   pooled = true;
   sp = { // minimal shim matching the bits we use
