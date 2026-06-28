@@ -135,8 +135,17 @@ fill (200 big tris, overdraw)     3.11       4.96         1.60x         5.4x    
 small (20k @ 8px)                 3.46       4.76         1.38x         —       ← win
 dense (16k mid tris)             23.4       38.9         1.67x         4.0x    ← win
 balanced (2k mid tris)            5.21       5.16         0.99x         2.5x        (tie)
-shade-bound (heavy frag)          7.45       7.29         0.98x         —
+shade-bound (heavy frag)          7.45       7.29         0.98x         —       (full-rate)
+shade-bound + coarse (2×1 VRS)    6.95       7.29         1.05x         —       ← win (fidelity lever)
 ```
+
+The `shade-bound` row is the one case where, at equal fidelity, llvmpipe's 256-bit
+AVX2 edges out portable 128-bit WASM by ~2% (it's all per-pixel transcendental ALU,
+the worst case for half the lane width). Turn on the **coarse-shading** fidelity
+lever (`SP_COARSE=1` / `{coarse:true}` — half-rate variable-rate shading, see the
+flags table below) and it flips to a **win**: 6.95 vs 7.29 = 1.05× here, up to 1.34×
+on a denser heavy shader. That's the thesis in one row — match at full fidelity, win
+when you spend a little.
 
 The `balanced` 2k row is the last sub-1.0×, and it's now a **statistical tie** (0.99×) —
 and a low-density artifact besides: at a trivially-low 2k triangles simdpipe's tile +
@@ -242,6 +251,26 @@ cheapest: affine vertex color               116     3.51x
 
 Bilinear→nearest alone is ~2×; the full ladder ~3.5×. **That's the whole thesis:**
 each knob you turn off buys speed — pick your point on the curve.
+
+### Fidelity flags — every speed-over-accuracy shortcut is an explicit, documented option
+
+simdpipe's speed shortcuts are **opt-in knobs, not silent defaults you can't turn
+off**. Three of them trade a little accuracy for speed; each is independently
+switchable, and the table says exactly what you give up. The structural wins
+(tiling, coarse-depth, affine fast path, convexity-clamp/const-alpha/varying-mask)
+are *always on* and **byte-identical** to the naive renderer — they cost nothing.
+
+| Flag | Default | Accuracy cost | What it does |
+|------|---------|---------------|--------------|
+| `-DSP_FAST` (build) | **on** in shipped `dist/` | **≤1 LSB** — same coverage % & mean RGB; ~3–5 px of a 512² frame differ by ±1 (invisible) | Speed-path vertex-color arithmetic: step depth incrementally (1 add/group vs a 2-mul-2-add barycentric lerp) + fold the ×255 into the color constants. Drop the flag (and rebuild) for a **bit-exact** renderer. |
+| `SP_FMA` (env, JIT) | **on** (`SP_FMA=1`) | **≤1 LSB** — one rounding per `a*b+c` instead of two | Relaxed-SIMD fused multiply-add in JIT shader kernels (sin poly, range reduction, `mix`, bilinear lerps). `SP_FMA=0` emits discrete mul+add for byte-exact JIT output. |
+| `SP_COARSE` (env) / `createJITProgram(src,{coarse:true})` | **off** | **visible** — half the *horizontal* shading rate (a bounded blur; coverage unchanged) | Coarse / 2×1 **variable-rate shading**: evaluate the fragment kernel once per horizontal pixel pair, reuse for the neighbour → half the transcendental throughput. This is the GPU-VRS trade; it flips the heavy `shade-bound` workload to a **win** (up to 1.34× on a dense heavy shader). Ignored for texture shaders. |
+
+The first two keep the image indistinguishable (the same ≤1-LSB tolerance already
+shipped for JIT textures); the third is a deliberate, *visible* fidelity drop you
+ask for by name. Want the fully bit-exact reference? Build without `-DSP_FAST` and
+run with `SP_FMA=0` — every structural optimization stays, every arithmetic shortcut
+is off.
 
 ### Runtime shader JIT (Tier-1) — real GLSL, compiled to native SIMD
 

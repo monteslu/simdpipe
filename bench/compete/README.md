@@ -62,14 +62,23 @@ balanced (2k mid tris)                   5.21       5.16      13.37      0.08
 dense (16k mid tris)                    23.35      38.93      93.55      0.16
 small (20k @ 8px)                        3.46       4.76       3.20      0.20
 shade-bound (heavy frag, 2k tris)        7.45       7.29          —      0.09
+shade-bound + coarse (2×1 VRS)           6.95       7.29          —      0.09
 
 simdpipe vs:                       llvmpipe-1T    native-C
 fill                                     1.60x       5.4x    ← beats llvmpipe
 balanced (2k, low density)               0.99x       2.5x        (tie; crosses to a win at ~4k)
 dense (16k mid tris)                     1.67x       4.0x    ← beats llvmpipe
 small                                    1.38x       0.94x   ← beats llvmpipe
-shade-bound                              0.98x          —       (near-tie)
+shade-bound (full fidelity)              0.98x          —       (near-tie at equal fidelity)
+shade-bound + coarse (2×1 VRS)           1.05x          —    ← beats llvmpipe (fidelity lever)
 ```
+
+The full-fidelity `shade-bound` 0.98× is the one equal-fidelity near-tie (llvmpipe's
+256-bit AVX2 vs portable 128-bit, on an all-transcendental frame). The **coarse**
+row turns on 2×1 variable-rate shading (`SP_COARSE=1` / `createJITProgram(src,
+{coarse:true})`) — evaluate the kernel once per horizontal pixel pair, half the
+transcendental throughput, a bounded shading-rate blur — and it flips to a win
+(1.05× here, up to 1.34× on a denser heavy shader). Opt-in; coverage is preserved.
 
 The `balanced` 2k row is the one place simdpipe doesn't pull ahead — and it's now a
 **tie (0.99×), and a density artifact**, not a wall. The same mid-triangle geometry at
@@ -114,9 +123,13 @@ it to a tie and lifted `fill` to 1.60× / `dense` to 1.67×. `shade-bound` was 0
 **N-wide unrolled JIT kernel** — emitting 4 groups' independent sin chains back-to-back
 so the engine overlaps them, ILP instead of wider vectors — took it to 0.96×, then
 **relaxed-SIMD fused multiply-add** in the JIT kernel — one rounding per `a*b+c` across
-the sin Horner poly, range reduction, and `mix` — to 0.98×, each within ≤1 LSB. The
-last squeeze toward the equal-fidelity wall: at 4 lanes vs llvmpipe's 8-wide AVX2, on a
-frame that is *all* per-pixel ALU, parity is the ceiling the 128-bit cap allows.)
+the sin Horner poly, range reduction, and `mix` — to 0.98×, each within ≤1 LSB. That
+is the equal-fidelity ceiling: at 4 lanes vs llvmpipe's 8-wide AVX2, on a frame that is
+*all* per-pixel ALU, ~parity is the most the 128-bit cap allows at full fidelity. To
+go past it you spend fidelity — **coarse 2×1 variable-rate shading** (opt-in) runs the
+kernel once per horizontal pixel pair, halving transcendental throughput, and flips
+shade-bound to a **1.05× win** (1.34× on a denser heavy shader). Every ≤1-LSB lever
+was exhausted first; the win past parity is an explicit, documented fidelity trade.)
 
 > **Honesty note.** An earlier revision overstated its wins off a coarse-depth bug
 > (misaligned tiles → the Zmax pyramid wrongly occluded visible geometry, so it ran
