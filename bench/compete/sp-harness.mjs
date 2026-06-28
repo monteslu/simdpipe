@@ -116,6 +116,17 @@ void main(){
   const snap = fbStats(sp.getFramebuffer(), W, H);
   if (DUMP) writePNG(`${DUMP}-${TAG}-heavy.png`, sp.getFramebuffer(), W, H, false);
   results.push({ name: 'shade-bound (heavy frag, 2k tris)', shader: 'heavy', ms: +ms.toFixed(3), ntris: 2000, jit: prog.jit, ...snap });
+
+  // Coarse (2×1 VRS) variant of the SAME heavy shader: the fidelity lever that flips
+  // shade-bound to a win — half the transcendental throughput, a bounded horizontal
+  // shading-rate blur (the project thesis: trade graphics fidelity for speed).
+  const progC = sp.createJITProgram(SRC, { coarse: true });
+  const drawC = () => { sp.clear(0xff180f10, 1.0); sp.drawProgram(spbuf, 2000, progC, { uT: 0.7 }); };
+  const msC = timeFrames(drawC);
+  drawC();
+  const snapC = fbStats(sp.getFramebuffer(), W, H);
+  if (DUMP) writePNG(`${DUMP}-${TAG}-heavy-coarse.png`, sp.getFramebuffer(), W, H, false);
+  results.push({ name: 'shade-bound coarse (2×1 VRS)', shader: 'heavy-coarse', ms: +msC.toFixed(3), ntris: 2000, jit: progC.jit, coarse: progC.coarse, ...snapC });
 }
 
 if (pooled) M._sp_pool_stop();
