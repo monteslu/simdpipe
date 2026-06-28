@@ -131,7 +131,7 @@ comparison. (512×512, V8 24, post-warmup — the steady state a real app render
 
 ```
 workload                      simdpipe   llvmpipe-1T   vs llvmpipe   vs scalar-C
-fill (200 big tris, overdraw)     3.11       4.96         1.60x         5.4x    ← win
+fill (200 big tris, overdraw)     2.65       4.84         1.83x         6.6x    ← win (adaptive 16px tile)
 small (20k @ 8px)                 3.46       4.76         1.38x         —       ← win
 dense (16k mid tris)             23.4       38.9         1.67x         4.0x    ← win
 balanced (2k mid tris)            5.21       5.16         0.99x         2.5x        (tie)
@@ -156,7 +156,7 @@ was a 0.79× loss; a stack of "do less work" wins — a convexity proof that ski
 clamp on in-range affine color, a constant-alpha fast path, a varying-plane mask that
 stops the shade pass writing unused G-buffer channels, and **incremental z-stepping +
 a ×255-folded color pack** in the speed path — closed it to a tie and lifted every win,
-`fill` to **1.60×** and `dense` to **1.67×**.)
+`fill` to **1.83×** and `dense` to **1.67×**.)
 
 **Textured** (the workload real renderers actually run — same checker texture, both
 single-thread, outputs pixel-matched):
@@ -177,12 +177,15 @@ also beats llvmpipe at **bilinear** on the rest — fill 1.57×, small ~1.7×, b
 ~1.2×.
 
 **simdpipe beats Mesa's 256-bit AVX2 software renderer on every realistic workload** —
-vertex-color `fill` (**1.60×**), `small` (1.38×), dense scenes (**1.67×**), and textured
+vertex-color `fill` (**1.83×**), `small` (1.38×), dense scenes (**1.67×**), and textured
 `fill`/`small`/dense (1.32×, 1.44×, **3.23×**) — by being algorithmically smarter, not
-wider: a hierarchical tiled rasterizer (trivial-reject/accept whole 8px tiles), a
-**coarse per-tile Zmax depth pyramid** that skips fully-occluded tiles in one compare
-(engaged only for big triangles, where it pays), **tight bbox-snapped tiles** that
-don't march empty leading columns, an **affine fast path** that drops the per-pixel
+wider: a hierarchical tiled rasterizer with an **adaptive tile size** (a coarse 16px
+tile for big-and-few triangles — it amortizes per-tile setup over big spans, +20% on
+`fill` — and a fine 8px tile for dense scenes where it rejects empty space better;
+output-identical either way), a **coarse per-tile Zmax depth pyramid** that skips
+fully-occluded tiles in one compare (engaged only for big triangles, where it pays),
+**tight bbox-snapped tiles** that don't march empty leading columns, an **affine fast
+path** that drops the per-pixel
 perspective divide on flat geometry (a constant 1/w makes the divide a no-op), and a
 stack of **"do less work" wins** — skip the [0,1] clamp when convexity proves the
 interpolated color is already in range, fold a constant alpha in once instead of
@@ -334,7 +337,7 @@ the raw ALU kernel win (2.5–3.9× over scalar JS).
 - [x] **JIT texture sampling** — `texture()` compiles to an in-kernel SIMD gather (nearest + bilinear); no JS fallback, validated vs the oracle (~31× over the JS shader)
 - [x] GL-shaped front end — MVP transform, vertex stage, `drawArrays`, spinning textured cube
 - [x] Fidelity ladder — bilinear/nearest, perspective/affine, texture/flat (~3.5× span)
-- [x] **Hierarchical tiled rasterizer + coarse per-tile Zmax depth pyramid + "do less" shortcuts** (clamp/alpha/varying-mask, incremental z-step) — beats llvmpipe single-thread on every realistic workload (fill 1.60×, dense 1.67×, small 1.38×, 3.23× on dense textured); a tie on the two synthetic worst cases
+- [x] **Hierarchical tiled rasterizer + coarse per-tile Zmax depth pyramid + "do less" shortcuts** (clamp/alpha/varying-mask, incremental z-step) — beats llvmpipe single-thread on every realistic workload (fill 1.83×, dense 1.67×, small 1.38×, 3.23× on dense textured); a tie on the two synthetic worst cases
 - [x] **Thread-safe coarse-depth** (per-band private Zmax rows — the grid is row-major, bands are disjoint, so each band owns its rows with no lock) — brings the overdraw win to the pool
 - [x] **Per-band triangle binning** (each worker iterates only its band's triangles, not the whole list re-clipped) — kills the 39× setup blowup; heavy fill 2.5×→4.1×, beats static band-spawn
 - [ ] True 2D per-tile binning (one tile = one parallel work unit) — tighten the pool on mid/dense scenes further

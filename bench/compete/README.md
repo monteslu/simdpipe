@@ -57,7 +57,7 @@ under-reports simdpipe by measuring it before the engine finishes optimizing.
 
 ```
 workload                             simdpipe   llvmpipe   native-C       GPU
-fill (200 big tris, overdraw)            3.11       4.96      17.50      0.07
+fill (200 big tris, overdraw)            2.65       4.84      17.50      0.07
 balanced (2k mid tris)                   5.21       5.16      13.37      0.08
 dense (16k mid tris)                    23.35      38.93      93.55      0.16
 small (20k @ 8px)                        3.46       4.76       3.20      0.20
@@ -65,7 +65,7 @@ shade-bound (heavy frag, 2k tris)        7.45       7.29          —      0.09
 shade-bound + coarse (2×1 VRS)           6.95       7.29          —      0.09
 
 simdpipe vs:                       llvmpipe-1T    native-C
-fill                                     1.60x       5.4x    ← beats llvmpipe
+fill                                     1.83x       6.6x    ← beats llvmpipe (adaptive 16px tile)
 balanced (2k, low density)               0.99x       2.5x        (tie; crosses to a win at ~4k)
 dense (16k mid tris)                     1.67x       4.0x    ← beats llvmpipe
 small                                    1.38x       0.94x   ← beats llvmpipe
