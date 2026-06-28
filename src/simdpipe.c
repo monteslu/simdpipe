@@ -45,13 +45,21 @@ enum {
 };
 
 /* Rasterizer tile size (pixels). Used for hierarchical reject/accept AND the
- * coarse per-tile Zmax depth-rejection grid, so it's a file-level constant. */
+ * coarse per-tile Zmax depth-rejection grid. The DEFAULT (8) wins 3/4 (finer tile
+ * rejects empty space far better on dense scenes). But big-triangle / low-count
+ * frames (fill) prefer a coarser 16px tile — less per-tile reject/accept overhead
+ * amortized over big spans (measured fill 3.22→2.64ms, 1.51→1.83×), as long as the
+ * Zmax grid resizes to match so 1 traversal tile still == 1 grid cell (fill at 16
+ * NEEDS ztile — without it it's 4.59ms). So TILE is a runtime ctx field chosen per
+ * frame from mean triangle size; the grid reallocs (cheaply, rarely) when it flips.
+ * SP_RASTER_TILE is now just the compile-time DEFAULT / single-value override. */
 #ifndef SP_RASTER_TILE
-#define SP_RASTER_TILE 8    /* re-swept w/ correct flags + tight tiles: 8 wins 3/4
-                             * (fill/small/dense-balanced all beat llvmpipe-1T; the
-                             * finer tile rejects empty space far better on dense
-                             * scenes — bal16k 37.7→27.8ms — and only gives up ~0.5ms
-                             * on fill, which still wins). 16 left selectable. */
+#define SP_RASTER_TILE 8
+#endif
+/* Per-frame TILE is clamped to [8, SP_TILE_MAX]; the grid is sized for the current
+ * tile. SP_ADAPT_TILE=0 (env, read in JS) or a fixed -DSP_RASTER_TILE pins it. */
+#ifndef SP_TILE_MAX
+#define SP_TILE_MAX 16
 #endif
 
 /* ---- renderer state ---- */
@@ -73,6 +81,10 @@ typedef struct {
    * covered by closer geometry, so rejection is always safe. */
   float   *ztile;
   int      tiles_w, tiles_h;
+  int      tile;            /* current traversal/grid tile size (pixels); see SP_RASTER_TILE */
+  int      ztile_cap;       /* allocated ztile cell capacity (so a coarser tile reuses it) */
+  float    clear_depth;     /* last sp_clear depth — re-fills the Zmax grid if tile flips mid-frame */
+  int      adapt_tile;      /* 1 = sp_draw_triangles_flat auto-picks tile from mean bbox */
 
   /* stats */
   uint64_t frag_tested;
@@ -110,11 +122,17 @@ EXPORT int sp_init(int w, int h) {
   g_ctx.color = (uint32_t *)malloc(npx * 4);
   g_ctx.depth = (float *)malloc(npx * sizeof(float));
   if (!g_ctx.color || !g_ctx.depth) return 0;
-  /* coarse Zmax tile grid */
-  g_ctx.tiles_w = (w + SP_RASTER_TILE - 1) / SP_RASTER_TILE;
-  g_ctx.tiles_h = (h + SP_RASTER_TILE - 1) / SP_RASTER_TILE;
-  g_ctx.ztile = (float *)malloc((size_t)g_ctx.tiles_w * g_ctx.tiles_h * sizeof(float));
-  if (!g_ctx.ztile) return 0;
+  /* coarse Zmax tile grid. Allocate for the FINEST tile (8 → most cells) so a
+   * coarser per-frame tile reuses the same buffer; tiles_w/h track the CURRENT tile. */
+  g_ctx.tile = SP_RASTER_TILE;
+  g_ctx.tiles_w = (w + g_ctx.tile - 1) / g_ctx.tile;
+  g_ctx.tiles_h = (h + g_ctx.tile - 1) / g_ctx.tile;
+  {
+    int fine_w = (w + 7) / 8, fine_h = (h + 7) / 8;
+    g_ctx.ztile_cap = fine_w * fine_h;
+    g_ctx.ztile = (float *)malloc((size_t)g_ctx.ztile_cap * sizeof(float));
+    if (!g_ctx.ztile) return 0;
+  }
   g_ctx.flags = SP_FLAG_DEPTH_TEST | SP_FLAG_TEXTURE | SP_FLAG_BILINEAR | SP_FLAG_PERSP_CORRECT;
   return 1;
 }
@@ -126,6 +144,32 @@ EXPORT int       sp_height(void) { return g_ctx.h; }
 
 EXPORT void sp_set_flags(uint32_t flags) { g_ctx.flags = flags; }
 EXPORT uint32_t sp_get_flags(void) { return g_ctx.flags; }
+
+/* Set the per-frame traversal/grid tile size (pixels). Clamped to a multiple of 8 in
+ * [8, SP_TILE_MAX] so the ztile grid (allocated for the finest tile) always has room and
+ * stays cell-aligned to pool bands (which are 16px-high). Recomputes tiles_w/h; no
+ * realloc (the buffer is sized for tile=8, the most cells). Call before sp_clear so the
+ * Zmax grid is reset at the right resolution. Used for adaptive tiling (JS picks the size
+ * from mean triangle bbox: big-tri frames want 16, mid/dense want 8). */
+EXPORT void sp_set_tile(int t) {
+  if (t < 8) t = 8;
+  if (t > SP_TILE_MAX) t = SP_TILE_MAX;
+  t &= ~7;                 /* multiple of 8 */
+  if (t < 8) t = 8;
+  if (t == g_ctx.tile) return;
+  g_ctx.tile = t;
+  g_ctx.tiles_w = (g_ctx.w + t - 1) / t;
+  g_ctx.tiles_h = (g_ctx.h + t - 1) / t;
+  /* the Zmax grid is indexed at the NEW cell resolution, so re-fill it to the last
+   * clear depth (cells cleared at the old resolution are now mis-indexed). Safe: a
+   * grid all at clear depth rejects nothing until the first tile commits its Zmax. */
+  if (g_ctx.ztile) {
+    int nt = g_ctx.tiles_w * g_ctx.tiles_h;
+    for (int i = 0; i < nt; i++) g_ctx.ztile[i] = g_ctx.clear_depth;
+  }
+}
+EXPORT int sp_get_tile(void) { return g_ctx.tile; }
+EXPORT void sp_set_adapt_tile(int on) { g_ctx.adapt_tile = on ? 1 : 0; }
 
 EXPORT void sp_bind_texture(const uint32_t *px, int tw, int th) {
   g_ctx.tex = px; g_ctx.tex_w = tw; g_ctx.tex_h = th;
@@ -151,6 +195,7 @@ EXPORT void sp_clear(uint32_t rgba, float depth) {
   }
   for (; i < n; i++) { c[i] = rgba; if (g_ctx.flags & SP_FLAG_DEPTH_TEST) d[i] = depth; }
   /* reset the coarse Zmax grid to the clear depth (the tile's farthest possible) */
+  g_ctx.clear_depth = depth;
   if (g_ctx.ztile) {
     int nt = g_ctx.tiles_w * g_ctx.tiles_h;
     for (int t = 0; t < nt; t++) g_ctx.ztile[t] = depth;
@@ -366,7 +411,7 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
    *
    * On top of geometric reject/accept, a coarse Zmax test skips tiles where the
    * triangle is fully occluded (its min depth in the tile > the tile's Zmax). */
-  const int TILE = SP_RASTER_TILE;
+  const int TILE = ctx->tile;
   /* Coarse-depth (ztile) is a shared row-major grid (tiles_w × tiles_h). A worker
    * may touch ztile cells only in rows it EXCLUSIVELY owns, or two threads racing
    * the same cell corrupt the Zmax. The grid is row-major and bands are disjoint
@@ -390,8 +435,8 @@ EXPORT void sp_draw_triangle(const sp_vert *v0, const sp_vert *v1, const sp_vert
 #define SP_ZTILE_MIN_TILES 6
 #endif
   {
-    int tcw = ((maxx - 1) / SP_RASTER_TILE) - (minx / SP_RASTER_TILE) + 1;
-    int tch = ((maxy - 1) / SP_RASTER_TILE) - (miny / SP_RASTER_TILE) + 1;
+    int tcw = ((maxx - 1) / TILE) - (minx / TILE) + 1;
+    int tch = ((maxy - 1) / TILE) - (miny / TILE) + 1;
     if (tcw * tch < SP_ZTILE_MIN_TILES) do_ztile = 0;
   }
 #ifdef SP_FORCE_NO_ZTILE
@@ -765,15 +810,15 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
   /* SIMD + tiled traversal — same hierarchical reject/accept + coarse-depth as
    * sp_draw_triangle (this path was the shade-bound bottleneck: 94% of frame in
    * a scalar one-pixel loop). Writes 6 varying planes + a cover byte per lane. */
-  const int TILE = SP_RASTER_TILE;
+  const int TILE = ctx->tile;
   /* coarse-depth: safe for a banded worker as long as its band falls on ztile-cell
    * boundaries (it then owns those rows exclusively) — see sp_draw_triangle. */
   int band_aligned = (tl_clip_y0 % TILE == 0)
                      && (tl_clip_y1 % TILE == 0 || tl_clip_y1 >= ctx->h);
   int do_ztile = do_depth && ctx->ztile != NULL && band_aligned;
   {  /* engage only for big triangles — see sp_draw_triangle */
-    int tcw = ((maxx - 1) / SP_RASTER_TILE) - (minx / SP_RASTER_TILE) + 1;
-    int tch = ((maxy - 1) / SP_RASTER_TILE) - (miny / SP_RASTER_TILE) + 1;
+    int tcw = ((maxx - 1) / TILE) - (minx / TILE) + 1;
+    int tch = ((maxy - 1) / TILE) - (miny / TILE) + 1;
     if (tcw * tch < SP_ZTILE_MIN_TILES) do_ztile = 0;
   }
 #ifdef SP_FORCE_NO_ZTILE
@@ -901,6 +946,10 @@ static void sp_raster_gbuffer(const sp_vert *v0, const sp_vert *v1, const sp_ver
 }
 
 EXPORT void sp_draw_gbuffer_flat(const float *verts, int ntris) {
+  /* The G-buffer (deferred-shade) coverage pass rasterizes balanced-style geometry;
+   * the fine 8px tile is its best and the adaptive flat picker may have left a coarse
+   * tile from a prior color draw — pin fine for deterministic, optimal coverage fill. */
+  if (g_ctx.adapt_tile) sp_set_tile(8);
   for (int t = 0; t < ntris; t++) {
     const float *p = verts + (size_t)t * 30;
     sp_vert a, b, c;
@@ -911,10 +960,38 @@ EXPORT void sp_draw_gbuffer_flat(const float *verts, int ntris) {
   }
 }
 
+/* Adaptive tile pick: coarse 16 only wins for big-AND-few triangles. High triangle
+ * counts mean fine-8 reject dominates regardless of size, so skip the O(ntris) span
+ * scan there (pure overhead on dense frames) → fine default. Output-identical either
+ * way (edges recompute from absolute origin each scanline). Shared by flat + pooled. */
+static void sp_pick_tile(const float *verts, int ntris) {
+  int want = 8;
+  if (ntris > 0 && ntris <= 1024) {
+    float sumspan = 0.0f;
+    for (int t = 0; t < ntris; t++) {
+      const float *p = verts + (size_t)t * 30;
+      float x0=p[0],x1=p[10],x2=p[20], y0=p[1],y1=p[11],y2=p[21];
+      float xmn = x0<x1?(x0<x2?x0:x2):(x1<x2?x1:x2);
+      float xmx = x0>x1?(x0>x2?x0:x2):(x1>x2?x1:x2);
+      float ymn = y0<y1?(y0<y2?y0:y2):(y1<y2?y1:y2);
+      float ymx = y0>y1?(y0>y2?y0:y2):(y1>y2?y1:y2);
+      sumspan += (xmx - xmn) + (ymx - ymn);
+    }
+    if (sumspan / (float)ntris >= 64.0f) want = 16;  /* big tiles well-covered → coarse */
+  }
+  sp_set_tile(want);
+}
+
 /* Batch entry point: draw N triangles from a flat float buffer.
  * Layout per vertex (10 floats): x y z invw r g b a u v
  * Per triangle: 3 vertices = 30 floats. `verts` points at 3*N*10 floats. */
 EXPORT void sp_draw_triangles_flat(const float *verts, int ntris) {
+  /* Adaptive tiling: a coarse 16px tile amortizes the per-tile reject/accept setup
+   * over big-triangle spans (fill ~1.8x), but a fine 8px tile rejects empty space far
+   * better on dense/mid scenes. Pick from the mean screen bbox span: big-and-few →16,
+   * else →8. The grid re-fills to clear depth on a flip (sp_set_tile), so this stays
+   * correct after the caller's clear. Costs one O(ntris) span pass (cheap vs raster). */
+  if (g_ctx.adapt_tile) sp_pick_tile(verts, ntris);
   for (int t = 0; t < ntris; t++) {
     const float *p = verts + (size_t)t * 30;
     sp_vert a, b, c;
@@ -1136,6 +1213,9 @@ static void sp_pool_dispatch(const float *verts, int ntris, int gbuffer) {
  * the frame is too small to amortize thread sync. */
 EXPORT void sp_draw_triangles_pooled(const float *verts, int ntris) {
   if (!g_pool.started || ntris < SP_POOL_MIN_TRIS) { sp_draw_triangles_flat(verts, ntris); return; }
+  /* pick the tile ONCE before releasing workers (they all read ctx->tile + the grid);
+   * SP_TILE_ROWS(16) % {8,16} == 0 so bands stay cell-aligned at either tile. */
+  if (g_ctx.adapt_tile) sp_pick_tile(verts, ntris);
   sp_pool_dispatch(verts, ntris, 0);
 }
 
