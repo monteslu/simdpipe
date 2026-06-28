@@ -219,7 +219,7 @@ rest. This is the thesis in one table.
 
 ```
 workload                              sp 1T   sp pool8    sp pool24   llvmpipe MT (24 core)
-fill (200 big tris)                    2.65       2.62        2.68          0.93
+fill (200 big tris)                    2.65       1.41        1.65          0.93
 dense (16k mid tris)                  23.4        7.17        7.02          8.34   ← sp wins
 small (20k @ 8px)                      3.36       2.69        2.57          2.84   ← sp wins
 balanced (2k mid tris)                 5.30       1.90        2.11          1.19
@@ -227,13 +227,14 @@ balanced (2k mid tris)                 5.30       1.90        2.11          1.19
 
 At **equal core count** (pool24 vs llvmpipe's 24), simdpipe's persistent work-stealing
 pool **wins `dense` (7.0 vs 8.3ms) and `small` (2.6 vs 2.8ms)** — and wins `dense` even
-on just 8 threads (7.2ms, beating llvmpipe's 24-core 8.3). The two it doesn't win are
-both *too-little-parallelizable-work* cases, not algorithmic: **`fill`** is 200 huge
-overlapping triangles that y-band binning can't split (it correctly falls back to the
-fast single-thread path — 2.6ms — rather than pay pool overhead for no parallelism), and
-**`balanced`** (2k mid tris) saturates at ~1.9ms because the frame is so light the
-per-dispatch sync dominates past ~4 threads. Real frames with more geometry (the `dense`
-row) parallelize cleanly. The fixes that got it here:
+on just 8 threads (7.2ms, beating llvmpipe's 24-core 8.3). **`fill`** — 200 huge
+overlapping triangles that a y-band split can't divide — now parallelizes via **2D
+tiling** (each worker owns a screen column strip too, so a big triangle's pixels split
+across cores): pool8 2.62→**1.41ms** (1.86×), closing most of the gap to llvmpipe's
+0.93ms (the residual is per-cell triangle-setup redundancy — each big triangle is set up
+once per 2D cell it touches; per-cell binning would close it). **`balanced`** (2k mid
+tris) saturates at ~1.9ms because the frame is so light the per-dispatch sync dominates
+past ~4 threads — a parallelism floor, not an algorithm gap. The fixes that got it here:
 **per-band coarse-depth** (each worker owns its ztile rows exclusively — the grid is
 row-major and bands are disjoint, so no lock) and **per-band triangle binning** (the
 band model used to re-run every triangle's setup in every band it touched — a 39×
@@ -243,10 +244,11 @@ pool can't split still gets the coarse-16 tile — pooled fill 3.2→2.6ms), and
 **persistent per-band scatter cursor** (no per-frame malloc in the bin build).
 
 Where it still trails llvmpipe-MT (`fill`, `balanced`) it's a parallelism ceiling, not
-an algorithm gap: 200 huge triangles have nothing to bin apart, and a 2k-triangle frame
-is too light to amortize the dispatch sync past ~4 threads. True 2D per-tile binning
-(splitting a big triangle across cores by screen tile, not y-band) is the lever that
-would win `fill` MT too — tracked, not done. Surfaced, not hidden.
+an algorithm gap: `fill`'s 200 huge triangles now split across cores via 2D tiling
+(1.41ms, down from 2.62) but each is still set up once per cell it spans — per-cell
+triangle *binning* (vs just clipping) would close the last of the gap to llvmpipe. A
+2k-triangle `balanced` frame is simply too light to amortize the dispatch sync past ~4
+threads. Surfaced, not hidden.
 
 ### Part 3 — the thesis: trade fidelity for speed
 
